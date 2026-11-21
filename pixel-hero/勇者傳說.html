@@ -1,0 +1,3789 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>像素勇者傳說</title>
+  <style>
+    /* 純粹滿版無外框版面，等比例置中呈現遊戲畫面 */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000000;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    canvas#gameCanvas {
+      display: block;
+      width: min(100vw, calc(100vh * 512 / 480));
+      height: min(100vh, calc(100vw * 480 / 512));
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: pointer;
+      outline: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="512" height="480" tabindex="0"></canvas>
+
+  <script>
+    /**
+     * =========================================================================
+     * 像素勇者傳說 (主角：連恩)
+     * -------------------------------------------------------------------------
+     * - 8x8 粗顆粒極簡像素畫風 (Boss 為 16x16 粗像素)
+     * - 4x4 廣大世界 + 席格王國 (商店、打靶小遊戲、席格公主任務)
+     * - 開局無劍，須先與起始草原的神秘老人對話領取【勇者之劍】
+     * - 隱藏洞穴弓箭商店 (老人左邊 3 格暗牆，僅保留微弱閃爍，零文字提示)
+     * - 操作：WASD 移動 / E 揮劍與互動 / Q 使用裝備 / 1-5 切道具 / Z 切弓 / X 切箭 / R 選單 / M 靜音
+     * =========================================================================
+     */
+
+    // =========================================================================
+    // 1. 核心常數與畫布初始化
+    // =========================================================================
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+
+    const TILE_SIZE = 32;
+    const MAP_COLS = 16;
+    const MAP_ROWS = 13;
+    const HUD_H = 64;
+    const PLAY_Y = HUD_H;
+    const PLAY_W = MAP_COLS * TILE_SIZE; // 512
+    const PLAY_H = MAP_ROWS * TILE_SIZE; // 416
+    const SCREEN_W = 512;
+    const SCREEN_H = 480;
+
+    // 磚塊類型代號
+    const T = {
+      GRASS: 0,
+      PATH: 1,
+      TREE: 2,
+      WATER: 3,
+      ROCK: 4,
+      CRACKED: 5,
+      FLOOR: 6,
+      WALL: 7,
+      DOOR_LOCKED: 8,
+      TORCH: 9,
+      FLOWER: 10,
+      BRIDGE: 11,
+      CARPET: 12,
+      ROYAL_WALL: 13,
+      SECRET_WALL: 14,
+      CAVE_DOOR: 15,
+      CAVE_FLOOR: 16,
+      CAVE_WALL: 17,
+      CAVE_EXIT: 18,
+      RANGE_BARRIER: 19,
+      DARK_FLOOR: 20,
+      DARK_WALL: 21
+    };
+
+    // 不可通行磚塊集合
+    const SOLID_TILES = new Set([
+      T.TREE, T.WATER, T.ROCK, T.CRACKED, T.WALL,
+      T.DOOR_LOCKED, T.TORCH, T.ROYAL_WALL, T.SECRET_WALL,
+      T.CAVE_WALL, T.RANGE_BARRIER, T.DARK_WALL
+    ]);
+
+    // 弓與箭資料定義
+    const BOWS = {
+      wood:   { id: 'wood',   name: '木弓',   dmg: 2, price: 20,  homing: false, color: '#d97706', sprite: 'bowWood' },
+      sturdy: { id: 'sturdy', name: '結實弓', dmg: 3, price: 45,  homing: false, color: '#92400e', sprite: 'bowSturdy' },
+      magic:  { id: 'magic',  name: '魔力弓', dmg: 4, price: 80,  homing: false, color: '#38bdf8', sprite: 'bowMagic' },
+      hunter: { id: 'hunter', name: '追獵弓', dmg: 3, price: 120, homing: true,  color: '#4ade80', sprite: 'bowHunter' }
+    };
+    const BOW_ORDER = ['wood', 'sturdy', 'magic', 'hunter'];
+
+    const ARROWS = {
+      normal:    { id: 'normal',    name: '普通箭', price: 0,  pack: 0,  color: '#e2e8f0', sprite: 'arrowNormal' },
+      fire:      { id: 'fire',      name: '火箭',   price: 15, pack: 10, color: '#f97316', sprite: 'arrowFire' },
+      poison:    { id: 'poison',    name: '毒箭',   price: 20, pack: 10, color: '#a855f7', sprite: 'arrowPoison' },
+      explosive: { id: 'explosive', name: '爆炸箭', price: 35, pack: 8,  color: '#ef4444', sprite: 'arrowExplosive' },
+      light:     { id: 'light',     name: '光箭',   price: 45, pack: 8,  color: '#fef08a', sprite: 'arrowLight' }
+    };
+    const ARROW_ORDER = ['normal', 'fire', 'poison', 'explosive', 'light'];
+
+    // =========================================================================
+    // 2. Web Audio API 8-Bit 晶片音效與背景音樂引擎
+    // =========================================================================
+    class RetroSound {
+      constructor() {
+        this.ctx = null;
+        this.muted = false;
+        this.bgmTimer = 0;
+        this.bgmStep = 0;
+      }
+
+      init() {
+        if (!this.ctx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (AC) this.ctx = new AC();
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+      }
+
+      toggleMute() {
+        this.muted = !this.muted;
+      }
+
+      tone(freq, dur, type = 'square', vol = 0.08, delay = 0, slideTo = null) {
+        if (this.muted || !this.ctx) return;
+        try {
+          const now = this.ctx.currentTime + delay;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, now);
+          if (slideTo) {
+            osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), now + dur);
+          }
+          gain.gain.setValueAtTime(vol, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+          osc.start(now);
+          osc.stop(now + dur + 0.01);
+        } catch (e) {}
+      }
+
+      noise(dur, vol = 0.1, delay = 0) {
+        if (this.muted || !this.ctx) return;
+        try {
+          const now = this.ctx.currentTime + delay;
+          const len = Math.floor(this.ctx.sampleRate * dur);
+          const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+          const data = buf.getChannelData(0);
+          for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+          const src = this.ctx.createBufferSource();
+          const gain = this.ctx.createGain();
+          src.buffer = buf;
+          gain.gain.setValueAtTime(vol, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+          src.connect(gain);
+          gain.connect(this.ctx.destination);
+          src.start(now);
+        } catch (e) {}
+      }
+
+      sfxSword()      { this.tone(520, 0.08, 'square', 0.07, 0, 180); }
+      sfxBeam()       { this.tone(880, 0.12, 'square', 0.06, 0, 440); }
+      sfxBow()        { this.tone(360, 0.07, 'triangle', 0.09, 0, 620); }
+      sfxFlame()      { this.noise(0.24, 0.12); this.tone(180, 0.22, 'sawtooth', 0.08, 0, 90); }
+      sfxHit()        { this.tone(220, 0.09, 'sawtooth', 0.09, 0, 90); }
+      sfxKill()       { this.tone(300, 0.07, 'square', 0.08, 0, 140); this.tone(180, 0.1, 'square', 0.07, 0.06, 70); }
+      sfxHurt()       { this.tone(170, 0.16, 'sawtooth', 0.11, 0, 75); }
+      sfxRupee()      { this.tone(987, 0.06, 'square', 0.06); this.tone(1318, 0.11, 'square', 0.06, 0.06); }
+      sfxHeart()      { this.tone(523, 0.07, 'triangle', 0.08); this.tone(659, 0.07, 'triangle', 0.08, 0.06); this.tone(784, 0.1, 'triangle', 0.08, 0.12); }
+      sfxBomb()       { this.noise(0.35, 0.16); this.tone(95, 0.32, 'sawtooth', 0.12, 0, 35); }
+      sfxSecret()     { [523, 587, 659, 784, 1046].forEach((n, i) => this.tone(n, 0.12, 'square', 0.07, i * 0.08)); }
+      sfxChest()      { [440, 554, 659, 880].forEach((n, i) => this.tone(n, 0.14, 'square', 0.08, i * 0.09)); }
+      sfxMenuSelect() { this.tone(660, 0.05, 'square', 0.05); }
+      sfxRoomChange() { this.tone(280, 0.06, 'triangle', 0.05, 0, 380); }
+      sfxFairyHeal()  { [659, 784, 987, 1318].forEach((n, i) => this.tone(n, 0.1, 'triangle', 0.07, i * 0.07)); }
+      sfxTargetHit()  { this.tone(880, 0.06, 'square', 0.07); this.tone(1174, 0.08, 'square', 0.07, 0.05); }
+      sfxBossRoar()   { this.tone(130, 0.35, 'sawtooth', 0.12, 0, 55); this.noise(0.25, 0.1, 0.05); }
+
+      updateBgm(dt, mode) {
+        if (this.muted || !this.ctx) return;
+        this.bgmTimer -= dt;
+        if (this.bgmTimer > 0) return;
+
+        let melody = [330, 392, 440, 392, 523, 440, 392, 330, 294, 330, 392, 440, 392, 330, 294, 247];
+        let tempo = 0.24;
+        if (mode === 'BOSS') {
+          melody = [196, 208, 220, 196, 174, 196, 165, 147, 196, 233, 220, 196, 165, 174, 147, 131];
+          tempo = 0.17;
+        } else if (mode === 'KINGDOM') {
+          melody = [392, 440, 494, 523, 587, 523, 494, 440, 392, 494, 587, 659, 587, 523, 494, 440];
+          tempo = 0.26;
+        } else if (mode === 'CAVE') {
+          melody = [220, 261, 247, 196, 220, 294, 261, 220];
+          tempo = 0.34;
+        }
+
+        const note = melody[this.bgmStep % melody.length];
+        this.tone(note, tempo * 0.72, mode === 'BOSS' ? 'sawtooth' : 'square', 0.028);
+        if (this.bgmStep % 2 === 0) {
+          this.tone(note / 2, tempo * 0.9, 'triangle', 0.032);
+        }
+        this.bgmStep++;
+        this.bgmTimer = tempo;
+      }
+    }
+
+    const sound = new RetroSound();
+
+    // =========================================================================
+    // 3. 極簡 8x8 / 16x16 粗顆粒像素精靈圖產生器
+    // =========================================================================
+    function buildSprite(rows, palette, scale = 4) {
+      const h = rows.length;
+      const w = rows[0].length;
+      const c = document.createElement('canvas');
+      c.width = w * scale;
+      c.height = h * scale;
+      const g = c.getContext('2d');
+      g.imageSmoothingEnabled = false;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const ch = rows[y][x];
+          if (ch !== '.' && palette[ch]) {
+            g.fillStyle = palette[ch];
+            g.fillRect(x * scale, y * scale, scale, scale);
+          }
+        }
+      }
+      return c;
+    }
+
+    const PAL = {
+      G: '#22c55e', g: '#15803d', S: '#fde68a', H: '#92400e', K: '#0f172a',
+      B: '#3b82f6', b: '#1d4ed8', R: '#ef4444', r: '#991b1b', Y: '#facc15',
+      y: '#ca8a04', W: '#f8fafc', C: '#38bdf8', c: '#0284c7', P: '#f472b6',
+      p: '#db2777', V: '#a855f7', v: '#6b21a8', O: '#f97316', o: '#c2410c',
+      M: '#94a3b8', m: '#475569', D: '#1e293b', L: '#84cc16', T: '#d97706'
+    };
+
+    const SPRITES = {
+      // 主角連恩 (8x8 極簡像素)
+      heroDown: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.HSSSSH.',
+        '.SKSSKS.',
+        '.GGGGGG.',
+        '.GBYYBG.',
+        '..GGGG..',
+        '..H..H..'
+      ], PAL, 3),
+      heroUp: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.HHHHHH.',
+        '.HHHHHH.',
+        '.GGGGGG.',
+        '.GGGGGG.',
+        '..GGGG..',
+        '..H..H..'
+      ], PAL, 3),
+      heroLeft: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.SSSHH..',
+        '.KSSHH..',
+        '.GGGGGG.',
+        '.GYYGGG.',
+        '..GGGG..',
+        '..H.H...'
+      ], PAL, 3),
+      heroRight: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '..HHSSS.',
+        '..HHSSK.',
+        '.GGGGGG.',
+        '.GGGYYG.',
+        '..GGGG..',
+        '...H.H..'
+      ], PAL, 3),
+
+      // 主角連恩行走第 2 幀 (四向邁步擺手)
+      heroDown2: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.HSSSSH.',
+        '.SKSSKS.',
+        'SGGGGGG.',
+        '.GBYYBGS',
+        '..GGGG..',
+        '.H....H.'
+      ], PAL, 3),
+      heroUp2: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.HHHHHH.',
+        '.HHHHHH.',
+        '.GGGGGGS',
+        'SGGGGGG.',
+        '..GGGG..',
+        '.H....H.'
+      ], PAL, 3),
+      heroLeft2: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '.SSSHH..',
+        '.KSSHH..',
+        '.GGGGGG.',
+        '.GYYGGS.',
+        '..GGGG..',
+        '.H...H..'
+      ], PAL, 3),
+      heroRight2: buildSprite([
+        '..GGGG..',
+        '.GGGGGG.',
+        '..HHSSS.',
+        '..HHSSK.',
+        '.GGGGGG.',
+        '.SGGYYG.',
+        '..GGGG..',
+        '..H...H.'
+      ], PAL, 3),
+
+      // NPC (含待機呼吸第 2 幀)
+      oldMan: buildSprite([
+        '..WWWW..',
+        '.WSSSSW.',
+        '.SKSSKS.',
+        '.WWWWWW.',
+        '.RRRRRR.',
+        '.RWWWW..',
+        '..RRRR..',
+        '..H..H..'
+      ], PAL, 3),
+      oldMan2: buildSprite([
+        '........',
+        '..WWWW..',
+        '.WSSSSW.',
+        '.SKSSKS.',
+        '.WWWWWW.',
+        '.RRRRRR.',
+        '.RWWWW..',
+        '..H..H..'
+      ], PAL, 3),
+      princess: buildSprite([
+        '..Y..Y..',
+        '..YYYY..',
+        '.YSSSSY.',
+        '.SKSSKS.',
+        '.PPPPPP.',
+        '.PWWWWP.',
+        '.PPPPPP.',
+        '..P..P..'
+      ], PAL, 3),
+      princess2: buildSprite([
+        '........',
+        '..Y..Y..',
+        '..YYYY..',
+        '.YSSSSY.',
+        '.SKSSKS.',
+        '.PPPPPP.',
+        '.PWWWWP.',
+        '..P..P..'
+      ], PAL, 3),
+      merchant: buildSprite([
+        '..BBBB..',
+        '.BBBBBB.',
+        '.HSSSSH.',
+        '.SKSSKS.',
+        '.TTTTTT.',
+        '.TYYYYT.',
+        '..TTTT..',
+        '..K..K..'
+      ], PAL, 3),
+      merchant2: buildSprite([
+        '........',
+        '..BBBB..',
+        '.BBBBBB.',
+        '.HSSSSH.',
+        '.SKSSKS.',
+        '.TTTTTT.',
+        '.TYYYYT.',
+        '..K..K..'
+      ], PAL, 3),
+      guard: buildSprite([
+        '..MMMM..',
+        '.MMCCMM.',
+        '.MSSSSM.',
+        '.MKSSKM.',
+        '.BBBBBB.',
+        '.MBYYBM.',
+        '..BBBB..',
+        '..M..M..'
+      ], PAL, 3),
+      guard2: buildSprite([
+        '........',
+        '..MMMM..',
+        '.MMCCMM.',
+        '.MSSSSM.',
+        '.MKSSKM.',
+        '.BBBBBB.',
+        '.MBYYBM.',
+        '..M..M..'
+      ], PAL, 3),
+
+      // 敵人 (8x8，皆含行走/彈跳/拍翅第 2 幀)
+      slime: buildSprite([
+        '........',
+        '..CCCC..',
+        '.CCCCCC.',
+        'CCKCCKCC',
+        'CCCCCCCC',
+        'CCWWWWCC',
+        '.CCCCCC.',
+        '........'
+      ], PAL, 3),
+      slime2: buildSprite([
+        '........',
+        '........',
+        '..CCCC..',
+        '.CCCCCC.',
+        'CCKCCKCC',
+        'CCWWWWCC',
+        'CCCCCCCC',
+        '.CCCCCC.'
+      ], PAL, 3),
+      octorok: buildSprite([
+        '..RRRR..',
+        '.RRRRRR.',
+        'RRWRRWRR',
+        'RRKRRKRR',
+        '.RRRRRR.',
+        'RR.RR.RR',
+        'R..RR..R',
+        '........'
+      ], PAL, 3),
+      octorok2: buildSprite([
+        '..RRRR..',
+        '.RRRRRR.',
+        'RRWRRWRR',
+        'RRKRRKRR',
+        '.RRRRRR.',
+        '.RR..RR.',
+        'R.R..R.R',
+        'R......R'
+      ], PAL, 3),
+      knight: buildSprite([
+        '..MMMM..',
+        '.MMMMMM.',
+        '.MKKKKM.',
+        '.MKRRKM.',
+        '.MMMMMM.',
+        '.mMBBMm.',
+        '..mMMm..',
+        '..K..K..'
+      ], PAL, 3),
+      knight2: buildSprite([
+        '..MMMM..',
+        '.MMMMMM.',
+        '.MKKKKM.',
+        '.MKRRKM.',
+        '.MMMMMM.',
+        'mMMBBMMm',
+        '..mMMm..',
+        '.K....K.'
+      ], PAL, 3),
+      darkKnight: buildSprite([
+        '..VVVV..',
+        '.VDDDDV.',
+        '.DKKKKD.',
+        '.DKRRKD.',
+        '.DDDDDD.',
+        '.VVRRVV.',
+        '..DDDD..',
+        '..V..V..'
+      ], PAL, 3),
+      darkKnight2: buildSprite([
+        '..VVVV..',
+        '.VDDDDV.',
+        '.DKKKKD.',
+        '.DKRRKD.',
+        '.DDDDDD.',
+        'VVDRRDVV',
+        '..DDDD..',
+        '.V....V.'
+      ], PAL, 3),
+      bat: buildSprite([
+        '........',
+        'V......V',
+        'VV.VV.VV',
+        'VVVKKVVV',
+        '.VVRVVR.',
+        '..VVVV..',
+        '...VV...',
+        '........'
+      ], PAL, 3),
+      bat2: buildSprite([
+        '........',
+        '........',
+        '..VVVV..',
+        '.VVKKVV.',
+        'VVVRVRVV',
+        'VV.VV.VV',
+        'V..VV..V',
+        '........'
+      ], PAL, 3),
+
+      // Boss 1: 火焰魔龍 (16x16，含展翅邁步第 2 幀)
+      dragon: buildSprite([
+        '....rr....rr....',
+        '...rRRr..rRRr...',
+        '..rRRRRrrRRRRr..',
+        '.rRRYYRRRRYYRRr.',
+        '.rRRKKRRRRKKRRr.',
+        '.rRRRRRRRRRRRRr.',
+        'rrRRRRWWWWWRRRrr',
+        'rOORRRRRRRRRROOr',
+        'rOOORROYYOORROOr',
+        'rrOORROYYOORROrr',
+        '.rRRRRYYYYRRRRr.',
+        '..rRRRYYYYRRRr..',
+        '..rRRRRRRRRRRr..',
+        '...rRRr..rRRr...',
+        '..rRRr....rRRr..',
+        '..YY........YY..'
+      ], PAL, 4),
+      dragon2: buildSprite([
+        '....rr....rr....',
+        '...rRRr..rRRr...',
+        'rr.rRRRRrrRRRRr.',
+        'rOOrRRYYRRRRYYrO',
+        'rOOORRRKRRRRKROr',
+        'rrOORRRRRRRRRROr',
+        '.rRRRRWWWWWRRRr.',
+        '..rRRRRRRRRRRr..',
+        '..rRRROYYORRRr..',
+        '..rRRROYYORRRr..',
+        '..rRRRYYYYRRRr..',
+        '..rRRRYYYYRRRr..',
+        '..rRRRRRRRRRRr..',
+        '..rRRr....rRRr..',
+        '.rRRr......rRRr.',
+        '.YY..........YY.'
+      ], PAL, 4),
+
+      // Final Boss: 災滅 (16x16，含暗影湧動第 2 幀)
+      zaimie: buildSprite([
+        '..VV........VV..',
+        '.VvvV..VV..VvvV.',
+        '.vDDv.VRRV.vDDv.',
+        '..vDDVDDDDVDDv..',
+        '..vDDDDDDDDDDv..',
+        '.vDDDRRKKRRDDDv.',
+        '.vDDDRWKKWRDDDv.',
+        '.vDDDDDDDDDDDDv.',
+        'VVDDVVRRRRVVDDVV',
+        'VvDDvDRRRRDvDDvV',
+        '.vDDvDDRRDDvDDv.',
+        '..vDDDDDDDDDDv..',
+        '..vDDVVDDVVDDv..',
+        '.vDDv.vDDv.vDDv.',
+        '.vVv...vv...vVv.',
+        '..V..........V..'
+      ], PAL, 4),
+      zaimie2: buildSprite([
+        '.VV..........VV.',
+        'VvvV...VV...VvvV',
+        '.vDDv.VRRV.vDDv.',
+        'VVvDDVDDDDVDDvVV',
+        'VvDDDDDDDDDDDDvV',
+        '.vDDDRWKKWRDDDv.',
+        '.vDDDRRKKRRDDDv.',
+        '..vDDDDDDDDDDv..',
+        '..vDVVRRRRVVDv..',
+        '..vDvDRRRRDvDv..',
+        '.vDDvDDRRDDvDDv.',
+        '..vDDDDDDDDDDv..',
+        '.vDDvVVDDVVvDDv.',
+        '.vVv..vDDv..vVv.',
+        '.V.....vv.....V.',
+        '................'
+      ], PAL, 4),
+
+      // 物品與圖示 (8x8)
+      heartFull: buildSprite([
+        '.RR..RR.',
+        'RRRRRRRR',
+        'RRWRRRRR',
+        'RRRRRRRR',
+        '.RRRRRR.',
+        '..RRRR..',
+        '...RR...',
+        '........'
+      ], PAL, 2),
+      heartEmpty: buildSprite([
+        '.mm..mm.',
+        'mKKmmKKm',
+        'mKKKKKKm',
+        'mKKKKKKm',
+        '.mKKKKm.',
+        '..mKKm..',
+        '...mm...',
+        '........'
+      ], PAL, 2),
+      rupee: buildSprite([
+        '...GG...',
+        '..GGGG..',
+        '.GGWGGG.',
+        '.GGGGGG.',
+        '.GGGGGG.',
+        '..GGGG..',
+        '...GG...',
+        '........'
+      ], PAL, 2),
+      rupeeBlue: buildSprite([
+        '...CC...',
+        '..CCCC..',
+        '.CCWCCC.',
+        '.CCCCCC.',
+        '.CCCCCC.',
+        '..CCCC..',
+        '...CC...',
+        '........'
+      ], PAL, 2),
+      key: buildSprite([
+        '..YYYY..',
+        '.YKKKKY.',
+        '..YYYY..',
+        '...YY...',
+        '...YYY..',
+        '...YY...',
+        '...YYY..',
+        '........'
+      ], PAL, 2),
+      bomb: buildSprite([
+        '....OY..',
+        '...O....',
+        '..DDDD..',
+        '.DDWDDD.',
+        '.DDDDDD.',
+        '.DDDDDD.',
+        '..DDDD..',
+        '........'
+      ], PAL, 2),
+      potion: buildSprite([
+        '...WW...',
+        '..WWWW..',
+        '...RR...',
+        '.RRRRRR.',
+        '.RRWRRR.',
+        '.RRRRRR.',
+        '..RRRR..',
+        '........'
+      ], PAL, 2),
+      boomerang: buildSprite([
+        '..CCCC..',
+        '.CCWWCC.',
+        'CC....CC',
+        'CC......',
+        'CC......',
+        '.CC.....',
+        '..CC....',
+        '........'
+      ], PAL, 2),
+      flameIcon: buildSprite([
+        '...OO...',
+        '..OOOO..',
+        '.OOYYOO.',
+        '.OYYYYO.',
+        'OOYWWYOO',
+        'OOYYYYOO',
+        '.OOOOOO.',
+        '..RRRR..'
+      ], PAL, 2),
+      sword1: buildSprite([
+        '......MM',
+        '.....MMW',
+        '....MMW.',
+        '...MMW..',
+        '.YYMM...',
+        '..YY....',
+        '.H.YY...',
+        'H.......'
+      ], PAL, 2),
+      sword2: buildSprite([
+        '......CC',
+        '.....CCW',
+        '....CCW.',
+        '...CCW..',
+        '.YYCC...',
+        '..YY....',
+        '.B.YY...',
+        'B.......'
+      ], PAL, 2),
+      bowWood: buildSprite([
+        '..TT....',
+        '.T..W...',
+        'T...W...',
+        'T...W...',
+        'T...W...',
+        'T...W...',
+        '.T..W...',
+        '..TT....'
+      ], PAL, 2),
+      bowSturdy: buildSprite([
+        '..HH....',
+        '.HYYW...',
+        'HY..W...',
+        'H...W...',
+        'H...W...',
+        'HY..W...',
+        '.HYYW...',
+        '..HH....'
+      ], PAL, 2),
+      bowMagic: buildSprite([
+        '..CC....',
+        '.CBBW...',
+        'CB..W...',
+        'C...W...',
+        'C...W...',
+        'CB..W...',
+        '.CBBW...',
+        '..CC....'
+      ], PAL, 2),
+      bowHunter: buildSprite([
+        '..GG....',
+        '.GLLW...',
+        'GL..W...',
+        'G...W...',
+        'G...W...',
+        'GL..W...',
+        '.GLLW...',
+        '..GG....'
+      ], PAL, 2),
+      arrowNormal: buildSprite([
+        '......WW',
+        '.....WWW',
+        '....TTW.',
+        '...TT...',
+        '..TT....',
+        '.MT.....',
+        'MM......',
+        'M.......'
+      ], PAL, 2),
+      arrowFire: buildSprite([
+        '......OO',
+        '.....OYY',
+        '....TTO.',
+        '...TT...',
+        '..TT....',
+        '.OT.....',
+        'OO......',
+        'R.......'
+      ], PAL, 2),
+      arrowPoison: buildSprite([
+        '......VV',
+        '.....VLL',
+        '....TTV.',
+        '...TT...',
+        '..TT....',
+        '.VT.....',
+        'VV......',
+        'v.......'
+      ], PAL, 2),
+      arrowExplosive: buildSprite([
+        '......RR',
+        '.....RRO',
+        '....TTR.',
+        '...TT...',
+        '..TT....',
+        '.RT.....',
+        'RR......',
+        'D.......'
+      ], PAL, 2),
+      arrowLight: buildSprite([
+        '......YY',
+        '.....YWW',
+        '....CCY.',
+        '...CC...',
+        '..CC....',
+        '.YC.....',
+        'YY......',
+        'W.......'
+      ], PAL, 2),
+      chestClosed: buildSprite([
+        'HHHHHHHH',
+        'HTTTTTTH',
+        'HTTTTTTH',
+        'HYYYYYYH',
+        'HTTYYTTH',
+        'HTTTTTTH',
+        'HTTTTTTH',
+        'HHHHHHHH'
+      ], PAL, 3),
+      chestOpen: buildSprite([
+        'HHHHHHHH',
+        'HKKKKKKH',
+        'HYYYYYYH',
+        'HKKKKKKH',
+        'HTTTTTTH',
+        'HTTTTTTH',
+        'HTTTTTTH',
+        'HHHHHHHH'
+      ], PAL, 3),
+      fairy: buildSprite([
+        'W..PP..W',
+        'WWPPPPWW',
+        '.WPPPPW.',
+        '..PWWP..',
+        '.WPPPPW.',
+        'WW.PP.WW',
+        'W......W',
+        '........'
+      ], PAL, 2),
+      fairy2: buildSprite([
+        '........',
+        '..PPPP..',
+        '.WPPPPW.',
+        'WWPWWPWW',
+        'WWPPPPWW',
+        'W..PP..W',
+        '........',
+        '........'
+      ], PAL, 2),
+      target: buildSprite([
+        '..RRRR..',
+        '.RWWWWR.',
+        'RWWRRWWR',
+        'RWRYYRWR',
+        'RWRYYRWR',
+        'RWWRRWWR',
+        '.RWWWWR.',
+        '..RRRR..'
+      ], PAL, 3),
+      relic: buildSprite([
+        '...YY...',
+        '..YYYY..',
+        '.YYWWYY.',
+        'YYYYYYYY',
+        'YY.YY.YY',
+        'Y..YY..Y',
+        'YYYYYYYY',
+        '........'
+      ], PAL, 3)
+    };
+
+    // =========================================================================
+    // 4. 4x4 世界地圖與隱藏洞穴商店建構器
+    // =========================================================================
+    function createEmptyGrid(fill, border) {
+      const g = [];
+      for (let y = 0; y < MAP_ROWS; y++) {
+        const row = [];
+        for (let x = 0; x < MAP_COLS; x++) {
+          if (y === 0 || y === MAP_ROWS - 1 || x === 0 || x === MAP_COLS - 1) {
+            row.push(border);
+          } else {
+            row.push(fill);
+          }
+        }
+        g.push(row);
+      }
+      return g;
+    }
+
+    function carveExits(grid, exits, pathTile = T.PATH) {
+      // 北/南出口固定在第 7, 8 欄；西/東出口固定在第 5, 6, 7 列
+      if (exits.n) {
+        grid[0][7] = pathTile; grid[0][8] = pathTile;
+        grid[1][7] = pathTile; grid[1][8] = pathTile;
+      }
+      if (exits.s) {
+        grid[MAP_ROWS - 1][7] = pathTile; grid[MAP_ROWS - 1][8] = pathTile;
+        grid[MAP_ROWS - 2][7] = pathTile; grid[MAP_ROWS - 2][8] = pathTile;
+      }
+      if (exits.w) {
+        grid[5][0] = pathTile; grid[6][0] = pathTile; grid[7][0] = pathTile;
+        grid[5][1] = pathTile; grid[6][1] = pathTile; grid[7][1] = pathTile;
+      }
+      if (exits.e) {
+        grid[5][MAP_COLS - 1] = pathTile; grid[6][MAP_COLS - 1] = pathTile; grid[7][MAP_COLS - 1] = pathTile;
+        grid[5][MAP_COLS - 2] = pathTile; grid[6][MAP_COLS - 2] = pathTile; grid[7][MAP_COLS - 2] = pathTile;
+      }
+    }
+
+    function drawCrossPath(grid, exits, pathTile = T.PATH) {
+      if (exits.n) for (let y = 0; y <= 6; y++) { grid[y][7] = pathTile; grid[y][8] = pathTile; }
+      if (exits.s) for (let y = 6; y < MAP_ROWS; y++) { grid[y][7] = pathTile; grid[y][8] = pathTile; }
+      if (exits.w) for (let x = 0; x <= 8; x++) { grid[6][x] = pathTile; }
+      if (exits.e) for (let x = 7; x < MAP_COLS; x++) { grid[6][x] = pathTile; }
+    }
+
+    function buildWorld() {
+      const rooms = {};
+
+      // --- (0,0) 魔王神殿 (Boss 1: 火焰魔龍) ---
+      {
+        const exits = { e: true };
+        const grid = createEmptyGrid(T.FLOOR, T.WALL);
+        carveExits(grid, exits, T.FLOOR);
+        grid[2][2] = T.TORCH; grid[2][13] = T.TORCH;
+        grid[10][2] = T.TORCH; grid[10][13] = T.TORCH;
+        rooms['0,0'] = {
+          name: '魔王神殿', bgm: 'BOSS', exits, grid,
+          enemies: [{ type: 'dragon', x: 5 * TILE_SIZE, y: 4 * TILE_SIZE }],
+          npcs: [], signs: [], chests: [], shopItems: []
+        };
+      }
+
+      // --- (1,0) 古代遺跡大門 ---
+      {
+        const exits = { s: true, w: true, e: true };
+        const grid = createEmptyGrid(T.FLOOR, T.WALL);
+        carveExits(grid, exits, T.FLOOR);
+        drawCrossPath(grid, exits, T.FLOOR);
+        // 西側通往魔王神殿的大門需古代鑰匙開啟
+        grid[5][0] = T.DOOR_LOCKED;
+        grid[6][0] = T.DOOR_LOCKED;
+        grid[7][0] = T.DOOR_LOCKED;
+        grid[3][4] = T.TORCH; grid[3][11] = T.TORCH;
+        grid[9][4] = T.TORCH; grid[9][11] = T.TORCH;
+        rooms['1,0'] = {
+          name: '古代遺跡大門', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'knight', x: 4 * TILE_SIZE, y: 5 * TILE_SIZE },
+            { type: 'knight', x: 11 * TILE_SIZE, y: 7 * TILE_SIZE }
+          ],
+          npcs: [],
+          signs: [{ tx: 9, ty: 4, msg: '石碑：西門封鎖著【火焰魔龍】，需要【古代鑰匙】方可開啟。' }],
+          chests: [], shopItems: []
+        };
+      }
+
+      // --- (2,0) 騎士哨站 ---
+      {
+        const exits = { w: true, s: true, e: true };
+        const grid = createEmptyGrid(T.GRASS, T.ROCK);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][3] = T.WALL; grid[3][4] = T.WALL;
+        grid[3][11] = T.WALL; grid[3][12] = T.WALL;
+        grid[9][3] = T.WALL; grid[9][12] = T.WALL;
+        rooms['2,0'] = {
+          name: '騎士哨站', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'knight', x: 5 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'knight', x: 10 * TILE_SIZE, y: 8 * TILE_SIZE },
+            { type: 'octorok', x: 12 * TILE_SIZE, y: 4 * TILE_SIZE }
+          ],
+          npcs: [],
+          signs: [{ tx: 13, ty: 8, msg: '警告牌：東方是最終魔王【災滅】盤踞的禁地，請做好萬全準備！' }],
+          chests: [{ id: 'lightSword', tx: 8, ty: 2, reward: 'lightSword', opened: false }],
+          shopItems: []
+        };
+      }
+
+      // --- (3,0) 災滅禁地 (Final Boss: 災滅) ---
+      {
+        const exits = { w: true, s: true };
+        const grid = createEmptyGrid(T.DARK_FLOOR, T.DARK_WALL);
+        carveExits(grid, exits, T.DARK_FLOOR);
+        grid[2][2] = T.TORCH; grid[2][13] = T.TORCH;
+        grid[10][2] = T.TORCH; grid[10][13] = T.TORCH;
+        rooms['3,0'] = {
+          name: '災滅禁地', bgm: 'BOSS', exits, grid,
+          enemies: [{ type: 'zaimie', x: 7 * TILE_SIZE, y: 4 * TILE_SIZE }],
+          npcs: [], signs: [], chests: [], shopItems: []
+        };
+      }
+
+      // --- (0,1) 岩石峽谷 (可炸開裂縫岩壁取得迴力鏢) ---
+      {
+        const exits = { e: true, s: true };
+        const grid = createEmptyGrid(T.PATH, T.ROCK);
+        carveExits(grid, exits, T.PATH);
+        // 隱藏密室牆壁 (第 3 列)
+        for (let x = 2; x <= 13; x++) grid[3][x] = T.ROCK;
+        grid[3][7] = T.CRACKED;
+        grid[3][8] = T.CRACKED;
+        grid[7][3] = T.ROCK; grid[7][4] = T.ROCK;
+        grid[9][11] = T.ROCK; grid[9][12] = T.ROCK;
+        rooms['0,1'] = {
+          name: '岩石峽谷', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'octorok', x: 4 * TILE_SIZE, y: 5 * TILE_SIZE },
+            { type: 'octorok', x: 11 * TILE_SIZE, y: 6 * TILE_SIZE },
+            { type: 'slime', x: 6 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [],
+          signs: [{ tx: 10, ty: 4, msg: '探險筆記：北方岩壁有明顯裂縫，似乎能用【炸彈】炸開！' }],
+          chests: [{ id: 'boomerang', tx: 7, ty: 1, reward: 'boomerang', opened: false }],
+          shopItems: []
+        };
+      }
+
+      // --- (1,1) 起始草原 (神秘老人給劍 + 老人左邊 3 格暗牆) ---
+      {
+        const exits = { n: true, s: true, w: true, e: true };
+        const grid = createEmptyGrid(T.GRASS, T.TREE);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        // 裝飾與老人周邊地形
+        grid[2][1] = T.ROCK;
+        grid[2][2] = T.SECRET_WALL; // 神秘老人位於 (5,2)，往左剛好 3 格即 (2,2)！
+        grid[1][2] = T.ROCK;
+        grid[1][1] = T.ROCK;
+        grid[3][10] = T.FLOWER; grid[3][11] = T.FLOWER;
+        grid[9][3] = T.FLOWER; grid[9][4] = T.FLOWER;
+        grid[9][12] = T.FLOWER; grid[10][12] = T.FLOWER;
+        rooms['1,1'] = {
+          name: '起始草原', bgm: 'OVERWORLD', exits, grid,
+          enemies: [],
+          npcs: [{
+            type: 'oldMan', x: 5 * TILE_SIZE, y: 2 * TILE_SIZE,
+            givesSword: true
+          }],
+          signs: [{ tx: 12, ty: 2, msg: '指引牌：北↑古代遺跡｜南↓商店與王國｜西←峽谷｜東→迷霧森林' }],
+          chests: [], shopItems: []
+        };
+      }
+
+      // --- (2,1) 迷霧森林 (清光敵人掉古代鑰匙) ---
+      {
+        const exits = { w: true, n: true, s: true, e: true };
+        const grid = createEmptyGrid(T.GRASS, T.TREE);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][3] = T.TREE; grid[3][4] = T.TREE;
+        grid[3][11] = T.TREE; grid[3][12] = T.TREE;
+        grid[9][4] = T.TREE; grid[9][11] = T.TREE;
+        rooms['2,1'] = {
+          name: '迷霧森林', bgm: 'OVERWORLD', exits, grid,
+          clearDropsKey: true,
+          keyDropped: false,
+          enemies: [
+            { type: 'slime', x: 4 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'octorok', x: 11 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'slime', x: 5 * TILE_SIZE, y: 9 * TILE_SIZE },
+            { type: 'octorok', x: 10 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [],
+          signs: [{ tx: 10, ty: 2, msg: '獵人紙條：聽說清光這片森林的魔物會出現【古代鑰匙】。' }],
+          chests: [], shopItems: []
+        };
+      }
+
+      // --- (3,1) 北方荒野 ---
+      {
+        const exits = { w: true, n: true, s: true };
+        const grid = createEmptyGrid(T.PATH, T.ROCK);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][4] = T.ROCK; grid[3][11] = T.ROCK;
+        grid[9][4] = T.ROCK; grid[9][11] = T.ROCK;
+        rooms['3,1'] = {
+          name: '北方荒野', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'darkKnight', x: 5 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'bat', x: 11 * TILE_SIZE, y: 5 * TILE_SIZE },
+            { type: 'bat', x: 9 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [],
+          signs: [{ tx: 10, ty: 2, msg: '界碑：前方北方即是【災滅禁地】！' }],
+          chests: [{ id: 'wildTreasure', tx: 13, ty: 10, reward: 'rupees50', opened: false }],
+          shopItems: []
+        };
+      }
+
+      // --- (0,2) 荒野廢墟 ---
+      {
+        const exits = { n: true, e: true, s: true };
+        const grid = createEmptyGrid(T.PATH, T.ROCK);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][3] = T.WALL; grid[3][4] = T.WALL;
+        grid[9][3] = T.WALL; grid[9][12] = T.WALL;
+        rooms['0,2'] = {
+          name: '荒野廢墟', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'octorok', x: 4 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'knight', x: 10 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'bat', x: 6 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [], signs: [],
+          chests: [{ id: 'ruinGold', tx: 2, ty: 2, reward: 'rupees50', opened: false }],
+          shopItems: []
+        };
+      }
+
+      // --- (1,2) 湖畔商店 ---
+      {
+        const exits = { n: true, w: true, e: true, s: true };
+        const grid = createEmptyGrid(T.GRASS, T.TREE);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        // 湖水裝飾
+        for (let x = 2; x <= 5; x++) { grid[9][x] = T.WATER; grid[10][x] = T.WATER; }
+        for (let x = 10; x <= 13; x++) { grid[9][x] = T.WATER; grid[10][x] = T.WATER; }
+        // 商店地毯區
+        for (let x = 4; x <= 11; x++) { grid[3][x] = T.FLOOR; grid[4][x] = T.FLOOR; }
+        rooms['1,2'] = {
+          name: '湖畔商店', bgm: 'OVERWORLD', exits, grid,
+          enemies: [],
+          npcs: [{ type: 'merchant', x: 7.5 * TILE_SIZE, y: 2 * TILE_SIZE, msg: '湖畔商人：「歡迎光臨！站在商品前按 E 即可購買！」' }],
+          signs: [], chests: [],
+          shopItems: [
+            { id: 'potion', name: '生命藥水', price: 20, sprite: 'potion', x: 5 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { id: 'bomb3',  name: '炸彈x3',   price: 15, sprite: 'bomb',   x: 8 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { id: 'heartC', name: '愛心容器', price: 50, sprite: 'heartFull', x: 11 * TILE_SIZE, y: 4 * TILE_SIZE, onceKey: 'lakeHeart' }
+          ]
+        };
+      }
+
+      // --- (2,2) 妖精之泉 ---
+      {
+        const exits = { n: true, w: true, e: true, s: true };
+        const grid = createEmptyGrid(T.GRASS, T.TREE);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        for (let y = 4; y <= 8; y++) {
+          for (let x = 6; x <= 9; x++) grid[y][x] = T.WATER;
+        }
+        grid[6][6] = T.BRIDGE; grid[6][7] = T.BRIDGE; grid[6][8] = T.BRIDGE; grid[6][9] = T.BRIDGE;
+        grid[3][5] = T.FLOWER; grid[3][10] = T.FLOWER;
+        grid[9][5] = T.FLOWER; grid[9][10] = T.FLOWER;
+        rooms['2,2'] = {
+          name: '妖精之泉', bgm: 'KINGDOM', exits, grid,
+          isFairySpring: true,
+          enemies: [], npcs: [],
+          signs: [{ tx: 11, ty: 3, msg: '石碑：妖精之泉會自動治癒踏入此地的旅人。' }],
+          chests: [], shopItems: []
+        };
+      }
+
+      // --- (3,2) 王國大道 ---
+      {
+        const exits = { n: true, w: true, s: true };
+        const grid = createEmptyGrid(T.GRASS, T.ROYAL_WALL);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][6] = T.FLOWER; grid[3][9] = T.FLOWER;
+        grid[9][6] = T.FLOWER; grid[9][9] = T.FLOWER;
+        rooms['3,2'] = {
+          name: '王國大道', bgm: 'KINGDOM', exits, grid,
+          enemies: [
+            { type: 'slime', x: 4 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'octorok', x: 11 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [{ type: 'guard', x: 10 * TILE_SIZE, y: 4 * TILE_SIZE, msg: '王國衛兵：「南方就是【席格王國王宮】，公主正在等候勇者！」' }],
+          signs: [], chests: [], shopItems: []
+        };
+      }
+
+      // --- (0,3) 幽暗沼澤 ---
+      {
+        const exits = { n: true, e: true };
+        const grid = createEmptyGrid(T.GRASS, T.TREE);
+        carveExits(grid, exits, T.PATH);
+        drawCrossPath(grid, exits, T.PATH);
+        grid[3][2] = T.WATER; grid[3][3] = T.WATER; grid[4][2] = T.WATER;
+        grid[9][10] = T.WATER; grid[9][11] = T.WATER; grid[10][11] = T.WATER;
+        rooms['0,3'] = {
+          name: '幽暗沼澤', bgm: 'OVERWORLD', exits, grid,
+          enemies: [
+            { type: 'darkKnight', x: 5 * TILE_SIZE, y: 5 * TILE_SIZE },
+            { type: 'bat', x: 10 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { type: 'slime', x: 4 * TILE_SIZE, y: 9 * TILE_SIZE }
+          ],
+          npcs: [], signs: [],
+          chests: [{ id: 'swampHeart', tx: 2, ty: 10, reward: 'heartContainer', opened: false }],
+          shopItems: []
+        };
+      }
+
+      // --- (1,3) 席格王國・市集 (王國商店) ---
+      {
+        const exits = { n: true, w: true, e: true };
+        const grid = createEmptyGrid(T.FLOOR, T.ROYAL_WALL);
+        carveExits(grid, exits, T.FLOOR);
+        for (let x = 2; x <= 13; x++) { grid[3][x] = T.CARPET; grid[4][x] = T.CARPET; }
+        grid[2][2] = T.TORCH; grid[2][13] = T.TORCH;
+        rooms['1,3'] = {
+          name: '席格王國・市集', bgm: 'KINGDOM', exits, grid,
+          enemies: [],
+          npcs: [{ type: 'merchant', x: 7.5 * TILE_SIZE, y: 2 * TILE_SIZE, msg: '王國御用商人：「連恩少俠！這裡供應王室精選補給品，按 E 購買！」' }],
+          signs: [], chests: [],
+          shopItems: [
+            { id: 'potion', name: '生命藥水', price: 15, sprite: 'potion',    x: 3.5 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { id: 'bomb5',  name: '炸彈x5',   price: 20, sprite: 'bomb',      x: 6.5 * TILE_SIZE, y: 4 * TILE_SIZE },
+            { id: 'heartC', name: '愛心容器', price: 45, sprite: 'heartFull', x: 9.5 * TILE_SIZE, y: 4 * TILE_SIZE, onceKey: 'kingdomHeart' },
+            { id: 'key',    name: '古代鑰匙', price: 60, sprite: 'key',       x: 12.5 * TILE_SIZE, y: 4 * TILE_SIZE }
+          ]
+        };
+      }
+
+      // --- (2,3) 席格王國・廣場 (打靶小遊戲) ---
+      {
+        const exits = { n: true, w: true, e: true };
+        const grid = createEmptyGrid(T.FLOOR, T.ROYAL_WALL);
+        carveExits(grid, exits, T.FLOOR);
+        // 北邊靶場區隔欄
+        for (let x = 2; x <= 13; x++) grid[4][x] = T.RANGE_BARRIER;
+        grid[4][7] = T.FLOOR; grid[4][8] = T.FLOOR;
+        grid[1][2] = T.TORCH; grid[1][13] = T.TORCH;
+        rooms['2,3'] = {
+          name: '席格王國・打靶廣場', bgm: 'KINGDOM', exits, grid,
+          isMinigameRoom: true,
+          enemies: [],
+          npcs: [{
+            type: 'guard', x: 4 * TILE_SIZE, y: 8 * TILE_SIZE,
+            isMinigameHost: true
+          }],
+          signs: [{ tx: 11, ty: 8, msg: '打靶規則：10盧比挑戰15秒，按E發射練習箭！命中5分得30元、10分得70元！' }],
+          chests: [], shopItems: []
+        };
+      }
+
+      // --- (3,3) 席格王國・王宮 (席格公主) ---
+      {
+        const exits = { n: true, w: true };
+        const grid = createEmptyGrid(T.FLOOR, T.ROYAL_WALL);
+        carveExits(grid, exits, T.FLOOR);
+        for (let y = 2; y <= 10; y++) { grid[y][7] = T.CARPET; grid[y][8] = T.CARPET; }
+        for (let x = 1; x <= 8; x++) { grid[6][x] = T.CARPET; }
+        grid[2][5] = T.TORCH; grid[2][10] = T.TORCH;
+        grid[9][5] = T.TORCH; grid[9][10] = T.TORCH;
+        rooms['3,3'] = {
+          name: '席格王國・王宮', bgm: 'KINGDOM', exits, grid,
+          enemies: [],
+          npcs: [
+            { type: 'princess', x: 7.5 * TILE_SIZE, y: 2.6 * TILE_SIZE, isPrincess: true },
+            { type: 'guard', x: 5 * TILE_SIZE, y: 4 * TILE_SIZE, msg: '近衛騎士：「願王室之光守護你，連恩！」' },
+            { type: 'guard', x: 10 * TILE_SIZE, y: 4 * TILE_SIZE, msg: '近衛騎士：「席格公主就在紅毯盡頭！」' }
+          ],
+          signs: [], chests: [], shopItems: []
+        };
+      }
+
+      // --- 隱藏洞穴商店 (特殊房間鍵名 'secret_shop') ---
+      {
+        const grid = createEmptyGrid(T.CAVE_FLOOR, T.CAVE_WALL);
+        grid[MAP_ROWS - 1][7] = T.CAVE_EXIT;
+        grid[MAP_ROWS - 1][8] = T.CAVE_EXIT;
+        grid[2][2] = T.TORCH; grid[2][13] = T.TORCH;
+        rooms['secret_shop'] = {
+          name: '隱藏洞穴商店', bgm: 'CAVE', exits: {}, grid,
+          isSecretShop: true,
+          enemies: [],
+          npcs: [{ type: 'merchant', x: 7.5 * TILE_SIZE, y: 1.8 * TILE_SIZE, msg: '洞穴匠人：「喔！你竟然找到了這裡！上排是神弓，下排是特製箭矢，按 E 購買！」' }],
+          signs: [], chests: [],
+          shopItems: [
+            // 上排：4 把弓
+            { id: 'bow_wood',   name: '木弓',   price: 20,  sprite: 'bowWood',   x: 3 * TILE_SIZE,  y: 4.5 * TILE_SIZE, bowId: 'wood' },
+            { id: 'bow_sturdy', name: '結實弓', price: 45,  sprite: 'bowSturdy', x: 6 * TILE_SIZE,  y: 4.5 * TILE_SIZE, bowId: 'sturdy' },
+            { id: 'bow_magic',  name: '魔力弓', price: 80,  sprite: 'bowMagic',  x: 9 * TILE_SIZE,  y: 4.5 * TILE_SIZE, bowId: 'magic' },
+            { id: 'bow_hunter', name: '追獵弓', price: 120, sprite: 'bowHunter', x: 12 * TILE_SIZE, y: 4.5 * TILE_SIZE, bowId: 'hunter' },
+            // 下排：4 種特殊箭
+            { id: 'arr_fire',      name: '火箭x10',  price: 15, sprite: 'arrowFire',      x: 3 * TILE_SIZE,  y: 8.2 * TILE_SIZE, arrowId: 'fire' },
+            { id: 'arr_poison',    name: '毒箭x10',  price: 20, sprite: 'arrowPoison',    x: 6 * TILE_SIZE,  y: 8.2 * TILE_SIZE, arrowId: 'poison' },
+            { id: 'arr_explosive', name: '爆炸箭x8', price: 35, sprite: 'arrowExplosive', x: 9 * TILE_SIZE,  y: 8.2 * TILE_SIZE, arrowId: 'explosive' },
+            { id: 'arr_light',     name: '光箭x8',   price: 45, sprite: 'arrowLight',     x: 12 * TILE_SIZE, y: 8.2 * TILE_SIZE, arrowId: 'light' }
+          ]
+        };
+      }
+
+      return rooms;
+    }
+
+    // =========================================================================
+    // 5. 遊戲狀態管理
+    // =========================================================================
+    function createInitialGame() {
+      return {
+        state: 'TITLE', // TITLE | PLAYING | PAUSED | TRANSITION | GAMEOVER | VICTORY
+        time: 0,
+        playTime: 0,
+        rx: 1,
+        ry: 1,
+        inSecretShop: false,
+        rooms: buildWorld(),
+        visited: { '1,1': true },
+        purchasedOnce: {},
+        secretCaveOpened: false,
+        bossDefeated: false,
+        zaimieDefeated: false,
+        princessQuest: 'none', // none | active | completed
+        toast: { text: '', timer: 0 },
+        transition: null,
+        minigame: { active: false, timer: 0, score: 0, targets: [], spawnTimer: 0 },
+
+        player: {
+          x: 7.5 * TILE_SIZE,
+          y: 7 * TILE_SIZE,
+          w: 22,
+          h: 22,
+          dir: 'down',
+          speed: 132,
+          hp: 6,
+          maxHp: 6,
+          rupees: 25,
+          keys: 0,
+          bombs: 5,
+          potions: 1,
+          hasBoomerang: false,
+          hasFlame: false,
+          swordLevel: 0, // 開局無劍，須先找神秘老人對話
+          equippedItem: 'bomb', // bomb | potion | boomerang | flame | bow
+          ownedBows: [],
+          equippedBow: null,
+          equippedArrow: 'normal',
+          arrows: { fire: 0, poison: 0, explosive: 0, light: 0 },
+          relicShards: 0,
+          invuln: 0,
+          attackTimer: 0,
+          attackCooldown: 0,
+          flameCooldown: 0,
+          bowCooldown: 0,
+          walkAnim: 0,
+          knockVx: 0,
+          knockVy: 0
+        },
+
+        enemies: [],
+        projectiles: [],
+        bombs: [],
+        drops: [],
+        particles: [],
+        floatingTexts: [],
+        fairies: []
+      };
+    }
+
+    let game = createInitialGame();
+    const keys = {};
+
+    function getCurrentRoom() {
+      if (game.inSecretShop) return game.rooms['secret_shop'];
+      return game.rooms[`${game.rx},${game.ry}`];
+    }
+
+    function showToast(text, duration = 3.2) {
+      game.toast.text = text;
+      game.toast.timer = duration;
+    }
+
+    function addFloatingText(x, y, text, color = '#facc15') {
+      game.floatingTexts.push({ x, y, text, color, life: 1.0, maxLife: 1.0 });
+    }
+
+    function spawnParticles(x, y, color, count = 8, speed = 80) {
+      for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = (0.35 + Math.random() * 0.75) * speed;
+        game.particles.push({
+          x, y,
+          vx: Math.cos(a) * s,
+          vy: Math.sin(a) * s,
+          color,
+          size: Math.random() < 0.5 ? 4 : 6,
+          life: 0.25 + Math.random() * 0.28,
+          maxLife: 0.5
+        });
+      }
+    }
+
+    // =========================================================================
+    // 6. 房間載入、怪物生成與轉場系統
+    // =========================================================================
+    function createEnemyEntity(def) {
+      const stats = {
+        slime:      { w: 24, h: 24, hp: 3,  speed: 44, dmg: 1, sprite: 'slime',      shoot: false },
+        octorok:    { w: 24, h: 24, hp: 4,  speed: 52, dmg: 1, sprite: 'octorok',    shoot: true  },
+        knight:     { w: 24, h: 24, hp: 7,  speed: 58, dmg: 1, sprite: 'knight',     shoot: false },
+        darkKnight: { w: 24, h: 24, hp: 10, speed: 68, dmg: 2, sprite: 'darkKnight', shoot: true  },
+        bat:        { w: 24, h: 24, hp: 3,  speed: 86, dmg: 1, sprite: 'bat',        shoot: false, fly: true },
+        dragon:     { w: 60, h: 60, hp: 24, speed: 56, dmg: 2, sprite: 'dragon',     boss: true },
+        zaimie:     { w: 60, h: 60, hp: 52, speed: 74, dmg: 2, sprite: 'zaimie',     boss: true, finalBoss: true }
+      }[def.type];
+
+      return {
+        type: def.type,
+        x: def.x,
+        y: def.y,
+        w: stats.w,
+        h: stats.h,
+        hp: stats.hp,
+        maxHp: stats.hp,
+        speed: stats.speed,
+        dmg: stats.dmg,
+        sprite: stats.sprite,
+        shoot: !!stats.shoot,
+        fly: !!stats.fly,
+        boss: !!stats.boss,
+        finalBoss: !!stats.finalBoss,
+        dirX: 0,
+        dirY: 1,
+        aiTimer: 0.5 + Math.random(),
+        shootTimer: 1.4 + Math.random(),
+        hurtTimer: 0,
+        stunTimer: 0,
+        burnTimer: 0,
+        burnTick: 0,
+        poisonTimer: 0,
+        poisonTick: 0,
+        knockVx: 0,
+        knockVy: 0,
+        phase2: false,
+        attackCycle: 0,
+        animTime: Math.random() * 10
+      };
+    }
+
+    function enterRoom(rx, ry, isSecret = false) {
+      game.inSecretShop = isSecret;
+      if (!isSecret) {
+        game.rx = rx;
+        game.ry = ry;
+        game.visited[`${rx},${ry}`] = true;
+      }
+
+      const room = getCurrentRoom();
+      game.enemies = [];
+      game.projectiles = [];
+      game.bombs = [];
+      game.drops = [];
+      game.fairies = [];
+      game.minigame.active = false;
+      game.minigame.targets = [];
+
+      // 若起始草原的秘密通道已開啟，確保圖磚同步
+      if (!isSecret && rx === 1 && ry === 1 && game.secretCaveOpened) {
+        room.grid[2][2] = T.CAVE_DOOR;
+      }
+
+      // 生成敵人 (Boss 若已擊敗則不再重生)
+      for (const def of room.enemies) {
+        if (def.type === 'dragon' && game.bossDefeated) continue;
+        if (def.type === 'zaimie' && game.zaimieDefeated) continue;
+        game.enemies.push(createEnemyEntity(def));
+      }
+
+      // 妖精之泉飛舞小妖精
+      if (room.isFairySpring) {
+        for (let i = 0; i < 4; i++) {
+          game.fairies.push({
+            angle: (Math.PI * 2 * i) / 4,
+            radius: 38 + (i % 2) * 16,
+            cx: 8 * TILE_SIZE,
+            cy: 6.5 * TILE_SIZE
+          });
+        }
+        if (game.player.hp < game.player.maxHp) {
+          game.player.hp = game.player.maxHp;
+          sound.sfxFairyHeal();
+          spawnParticles(game.player.x + 11, game.player.y + 11, '#f472b6', 16, 90);
+          showToast('妖精之泉的魔力讓連恩恢復了全部生命！', 3.0);
+        }
+      }
+
+      if (!isSecret && rx === 0 && ry === 0 && !game.bossDefeated) {
+        sound.sfxBossRoar();
+        showToast('魔王神殿：火焰魔龍出現了！', 3.2);
+      } else if (!isSecret && rx === 3 && ry === 0 && !game.zaimieDefeated) {
+        sound.sfxBossRoar();
+        showToast('災滅禁地：終極魔王【災滅】降臨！', 3.6);
+      }
+    }
+
+    function startRoomTransition(dx, dy) {
+      const nextRx = game.rx + dx;
+      const nextRy = game.ry + dy;
+      if (!game.rooms[`${nextRx},${nextRy}`]) return;
+
+      sound.sfxRoomChange();
+      game.state = 'TRANSITION';
+      game.transition = {
+        dx, dy,
+        nextRx, nextRy,
+        progress: 0,
+        duration: 0.28
+      };
+    }
+
+    // =========================================================================
+    // 7. 碰撞檢測與地圖互動
+    // =========================================================================
+    function getTileAt(room, tx, ty) {
+      if (tx < 0 || tx >= MAP_COLS || ty < 0 || ty >= MAP_ROWS) return null;
+      return room.grid[ty][tx];
+    }
+
+    function collidesWithMap(room, x, y, w, h, allowEdgeExit = false) {
+      const left = Math.floor(x / TILE_SIZE);
+      const right = Math.floor((x + w - 0.1) / TILE_SIZE);
+      const top = Math.floor(y / TILE_SIZE);
+      const bottom = Math.floor((y + h - 0.1) / TILE_SIZE);
+
+      for (let ty = top; ty <= bottom; ty++) {
+        for (let tx = left; tx <= right; tx++) {
+          if (tx < 0 || tx >= MAP_COLS || ty < 0 || ty >= MAP_ROWS) {
+            if (allowEdgeExit) continue;
+            return true;
+          }
+          const tile = room.grid[ty][tx];
+          if (SOLID_TILES.has(tile)) return true;
+        }
+      }
+      return false;
+    }
+
+    function rectOverlap(a, b) {
+      return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    }
+
+    // =========================================================================
+    // 8. 玩家行動：揮劍、互動、道具、弓箭、火焰
+    // =========================================================================
+    function getDirVec(dir) {
+      if (dir === 'up') return { x: 0, y: -1 };
+      if (dir === 'down') return { x: 0, y: 1 };
+      if (dir === 'left') return { x: -1, y: 0 };
+      return { x: 1, y: 0 };
+    }
+
+    function getSwordHitbox() {
+      const p = game.player;
+      const reach = 28;
+      if (p.dir === 'up')    return { x: p.x - 2, y: p.y - reach, w: p.w + 4, h: reach };
+      if (p.dir === 'down')  return { x: p.x - 2, y: p.y + p.h,   w: p.w + 4, h: reach };
+      if (p.dir === 'left')  return { x: p.x - reach, y: p.y - 2, w: reach, h: p.h + 4 };
+      return { x: p.x + p.w, y: p.y - 2, w: reach, h: p.h + 4 };
+    }
+
+    function interactOldMan() {
+      const p = game.player;
+      if (p.swordLevel === 0) {
+        p.swordLevel = 1;
+        sound.sfxChest();
+        spawnParticles(p.x + 11, p.y + 11, '#facc15', 18, 100);
+        addFloatingText(p.x + 11, p.y - 8, '獲得勇者之劍!', '#facc15');
+        showToast('神秘老人：「一個人去太危險了！連恩，收下【勇者之劍】吧！東南是席格王國！」', 4.6);
+      } else {
+        sound.sfxMenuSelect();
+        showToast('神秘老人：「去吧，連恩！東南是【席格王國】，北方有古代遺跡與魔王神殿！」', 4.0);
+      }
+    }
+
+    function interactPrincess() {
+      const p = game.player;
+      if (game.bossDefeated && !p.hasFlame) {
+        game.princessQuest = 'completed';
+        p.hasFlame = true;
+        p.equippedItem = 'flame';
+        p.relicShards++;
+        p.hp = p.maxHp;
+        sound.sfxChest();
+        spawnParticles(p.x + 11, p.y + 11, '#f97316', 22, 120);
+        addFloatingText(p.x + 11, p.y - 8, '獲得秘寶【火焰】!', '#f97316');
+        showToast('席格公主：「感謝你擊敗火焰魔龍，連恩！賜你秘寶【火焰】(按4切換、Q施放)！去東北禁地討伐災滅吧！」', 5.5);
+      } else if (p.hasFlame) {
+        if (p.hp < p.maxHp) {
+          p.hp = p.maxHp;
+          sound.sfxFairyHeal();
+          spawnParticles(p.x + 11, p.y + 11, '#f472b6', 14, 90);
+          showToast('席格公主：「王室祝福已為你恢復滿血！連恩，請帶著【火焰】討伐『災滅』！」', 4.2);
+        } else {
+          sound.sfxMenuSelect();
+          showToast('席格公主：「連恩，【火焰】可射出一排密集火焰(冷卻3秒)，祝你戰勝『災滅』！」', 4.0);
+        }
+      } else {
+        game.princessQuest = 'active';
+        sound.sfxMenuSelect();
+        showToast('席格公主：「連恩！請討伐西北魔王神殿的【火焰魔龍】，完成後將賜予你秘寶【火焰】！」', 4.8);
+      }
+    }
+
+    function startMinigame() {
+      const p = game.player;
+      if (game.minigame.active) return;
+      if (p.rupees < 10) {
+        sound.sfxHurt();
+        showToast('靶場衛兵：「參加打靶小遊戲需要 10 盧比喔！」', 2.8);
+        return;
+      }
+      p.rupees -= 10;
+      sound.sfxMenuSelect();
+      game.minigame = {
+        active: true,
+        timer: 15.0,
+        score: 0,
+        targets: [],
+        spawnTimer: 0.2
+      };
+      // 將玩家定位至射擊區
+      p.x = 7.5 * TILE_SIZE;
+      p.y = 6.2 * TILE_SIZE;
+      p.dir = 'up';
+      showToast('打靶開始！左右移動並按 E 向北射擊移動靶！(15秒)', 3.0);
+    }
+
+    function buyShopItem(item) {
+      const p = game.player;
+      if (item.onceKey && game.purchasedOnce[item.onceKey]) {
+        showToast('這項商品已經賣完囉！', 2.0);
+        return;
+      }
+      if (item.bowId && p.ownedBows.includes(item.bowId)) {
+        p.equippedBow = item.bowId;
+        p.equippedItem = 'bow';
+        sound.sfxMenuSelect();
+        showToast(`已裝備【${BOWS[item.bowId].name}】！`, 2.2);
+        return;
+      }
+      if (p.rupees < item.price) {
+        sound.sfxHurt();
+        showToast(`盧比不足！需要 ${item.price} 盧比。`, 2.2);
+        return;
+      }
+
+      p.rupees -= item.price;
+      sound.sfxChest();
+
+      if (item.bowId) {
+        p.ownedBows.push(item.bowId);
+        p.equippedBow = item.bowId;
+        p.equippedItem = 'bow';
+        addFloatingText(p.x + 11, p.y - 8, `獲得${BOWS[item.bowId].name}!`, '#facc15');
+        showToast(`買下了【${BOWS[item.bowId].name}】！按 5 裝備弓箭，Z 切弓、X 切箭。`, 3.6);
+      } else if (item.arrowId) {
+        const pack = ARROWS[item.arrowId].pack;
+        p.arrows[item.arrowId] += pack;
+        p.equippedArrow = item.arrowId;
+        addFloatingText(p.x + 11, p.y - 8, `${ARROWS[item.arrowId].name}+${pack}`, ARROWS[item.arrowId].color);
+        showToast(`購買了【${ARROWS[item.arrowId].name}】x${pack}！`, 2.6);
+      } else if (item.id === 'potion') {
+        p.potions++;
+        showToast('購買了【生命藥水】x1！', 2.2);
+      } else if (item.id === 'bomb3') {
+        p.bombs += 3;
+        showToast('購買了【炸彈】x3！', 2.2);
+      } else if (item.id === 'bomb5') {
+        p.bombs += 5;
+        showToast('購買了【炸彈】x5！', 2.2);
+      } else if (item.id === 'heartC') {
+        p.maxHp += 2;
+        p.hp = p.maxHp;
+        if (item.onceKey) game.purchasedOnce[item.onceKey] = true;
+        showToast('購買了【愛心容器】！最大生命提升並補滿！', 3.0);
+      } else if (item.id === 'key') {
+        p.keys++;
+        showToast('購買了【古代鑰匙】x1！', 2.4);
+      }
+    }
+
+    function openChest(ch) {
+      const p = game.player;
+      ch.opened = true;
+      sound.sfxChest();
+      spawnParticles(ch.tx * TILE_SIZE + 16, ch.ty * TILE_SIZE + 16, '#facc15', 16, 100);
+
+      if (ch.reward === 'boomerang') {
+        p.hasBoomerang = true;
+        p.equippedItem = 'boomerang';
+        showToast('打開寶箱！獲得【迴力鏢】(按3切換、Q投擲，可擊暈敵人並回收道具)！', 4.4);
+      } else if (ch.reward === 'lightSword') {
+        p.swordLevel = 2;
+        p.relicShards++;
+        showToast('打開寶箱！獲得【聖光之劍】(攻擊力大幅提升) 與 1 個聖物碎片！', 4.2);
+      } else if (ch.reward === 'rupees50') {
+        p.rupees += 50;
+        p.relicShards++;
+        showToast('打開寶箱！獲得 50 盧比與 1 個聖物碎片！', 3.4);
+      } else if (ch.reward === 'heartContainer') {
+        p.maxHp += 2;
+        p.hp = p.maxHp;
+        showToast('打開寶箱！獲得【愛心容器】！最大生命提升！', 3.4);
+      }
+    }
+
+    function tryInteract() {
+      const p = game.player;
+      const room = getCurrentRoom();
+      const d = getDirVec(p.dir);
+      const px = p.x + p.w / 2 + d.x * 20;
+      const py = p.y + p.h / 2 + d.y * 20;
+
+      // 1. 檢查 NPC 對話
+      for (const npc of room.npcs) {
+        const dist = Math.hypot((npc.x + 12) - (p.x + p.w / 2), (npc.y + 12) - (p.y + p.h / 2));
+        if (dist < 42) {
+          if (npc.givesSword) interactOldMan();
+          else if (npc.isPrincess) interactPrincess();
+          else if (npc.isMinigameHost) startMinigame();
+          else {
+            sound.sfxMenuSelect();
+            showToast(npc.msg, 3.6);
+          }
+          return true;
+        }
+      }
+
+      // 2. 檢查商店商品
+      for (const item of room.shopItems) {
+        const dist = Math.hypot((item.x + 8) - (p.x + p.w / 2), (item.y + 8) - (p.y + p.h / 2));
+        if (dist < 30) {
+          buyShopItem(item);
+          return true;
+        }
+      }
+
+      // 3. 檢查寶箱
+      for (const ch of room.chests) {
+        if (ch.opened) continue;
+        const dist = Math.hypot((ch.tx * TILE_SIZE + 16) - px, (ch.ty * TILE_SIZE + 16) - py);
+        if (dist < 34) {
+          openChest(ch);
+          return true;
+        }
+      }
+
+      // 4. 檢查告示牌
+      for (const sg of room.signs) {
+        const dist = Math.hypot((sg.tx * TILE_SIZE + 16) - px, (sg.ty * TILE_SIZE + 16) - py);
+        if (dist < 34) {
+          sound.sfxMenuSelect();
+          showToast(sg.msg, 4.2);
+          return true;
+        }
+      }
+
+      // 5. 檢查上鎖大門
+      const tx = Math.floor(px / TILE_SIZE);
+      const ty = Math.floor(py / TILE_SIZE);
+      if (getTileAt(room, tx, ty) === T.DOOR_LOCKED) {
+        if (p.keys > 0) {
+          p.keys--;
+          room.grid[5][0] = T.FLOOR;
+          room.grid[6][0] = T.FLOOR;
+          room.grid[7][0] = T.FLOOR;
+          sound.sfxSecret();
+          spawnParticles(16, 6.5 * TILE_SIZE, '#facc15', 18, 90);
+          showToast('使用了【古代鑰匙】，魔王神殿的大門開啟了！', 3.6);
+        } else {
+          sound.sfxHurt();
+          showToast('大門緊鎖著，需要【古代鑰匙】才能打開！', 3.0);
+        }
+        return true;
+      }
+
+      return false;
+    }
+
+    function performAttackOrInteract() {
+      const p = game.player;
+
+      // 打靶小遊戲中按 E 直接向北發射練習箭
+      if (game.minigame.active) {
+        if (p.attackCooldown <= 0) {
+          p.attackCooldown = 0.24;
+          p.dir = 'up';
+          sound.sfxBow();
+          game.projectiles.push({
+            fromPlayer: true,
+            kind: 'practiceBolt',
+            x: p.x + p.w / 2 - 3,
+            y: p.y - 8,
+            w: 6, h: 14,
+            vx: 0, vy: -340,
+            dmg: 1,
+            color: '#facc15',
+            life: 1.2
+          });
+        }
+        return;
+      }
+
+      // 優先判定互動 (對話、買東西、開寶箱、讀告示牌、開鎖門)
+      if (tryInteract()) return;
+
+      // 未獲得劍前無法揮劍
+      if (p.swordLevel === 0) {
+        showToast('連恩目前還沒有武器！先去找起始草原的神秘老人對話吧。', 2.8);
+        return;
+      }
+
+      if (p.attackCooldown > 0) return;
+
+      p.attackTimer = 0.16;
+      p.attackCooldown = 0.25;
+      sound.sfxSword();
+
+      const hb = getSwordHitbox();
+      const dmg = p.swordLevel >= 2 ? 3 : 2;
+
+      // 檢查是否劈中隱藏暗牆 (起始草原老人左邊 3 格)
+      const room = getCurrentRoom();
+      const checkTiles = [
+        { tx: Math.floor(hb.x / TILE_SIZE), ty: Math.floor(hb.y / TILE_SIZE) },
+        { tx: Math.floor((hb.x + hb.w) / TILE_SIZE), ty: Math.floor((hb.y + hb.h) / TILE_SIZE) },
+        { tx: Math.floor((hb.x + hb.w / 2) / TILE_SIZE), ty: Math.floor((hb.y + hb.h / 2) / TILE_SIZE) }
+      ];
+      for (const ct of checkTiles) {
+        if (getTileAt(room, ct.tx, ct.ty) === T.SECRET_WALL) {
+          room.grid[ct.ty][ct.tx] = T.CAVE_DOOR;
+          game.secretCaveOpened = true;
+          sound.sfxSecret();
+          spawnParticles(ct.tx * TILE_SIZE + 16, ct.ty * TILE_SIZE + 16, '#facc15', 20, 100);
+          break;
+        }
+      }
+
+      // 劍擊命中敵人
+      for (const e of game.enemies) {
+        if (rectOverlap(hb, e)) {
+          damageEnemy(e, dmg, p.x + p.w / 2, p.y + p.h / 2);
+        }
+      }
+
+      // 滿血時發射經典遠程劍氣 (同時只存在一道)
+      const hasBeam = game.projectiles.some(pr => pr.kind === 'swordBeam');
+      if (p.hp >= p.maxHp && !hasBeam) {
+        const d = getDirVec(p.dir);
+        sound.sfxBeam();
+        game.projectiles.push({
+          fromPlayer: true,
+          kind: 'swordBeam',
+          x: p.x + p.w / 2 - 6,
+          y: p.y + p.h / 2 - 6,
+          w: 12, h: 12,
+          vx: d.x * 260,
+          vy: d.y * 260,
+          dmg: p.swordLevel >= 2 ? 2 : 1,
+          color: p.swordLevel >= 2 ? '#38bdf8' : '#facc15',
+          life: 1.2
+        });
+      }
+    }
+
+    function useEquippedItem() {
+      const p = game.player;
+
+      if (p.equippedItem === 'bomb') {
+        if (p.bombs <= 0) {
+          sound.sfxHurt();
+          showToast('炸彈用完了！', 1.8);
+          return;
+        }
+        p.bombs--;
+        const d = getDirVec(p.dir);
+        game.bombs.push({
+          x: p.x + p.w / 2 - 8 + d.x * 20,
+          y: p.y + p.h / 2 - 8 + d.y * 20,
+          timer: 1.35
+        });
+        sound.sfxMenuSelect();
+      } else if (p.equippedItem === 'potion') {
+        if (p.potions <= 0) {
+          sound.sfxHurt();
+          showToast('沒有生命藥水了！', 1.8);
+          return;
+        }
+        if (p.hp >= p.maxHp) {
+          showToast('連恩目前生命已經是滿的！', 1.8);
+          return;
+        }
+        p.potions--;
+        p.hp = Math.min(p.maxHp, p.hp + 6);
+        sound.sfxFairyHeal();
+        spawnParticles(p.x + 11, p.y + 11, '#ef4444', 14, 80);
+        addFloatingText(p.x + 11, p.y - 8, '+6 HP', '#4ade80');
+      } else if (p.equippedItem === 'boomerang') {
+        if (!p.hasBoomerang) {
+          showToast('尚未獲得迴力鏢！', 1.8);
+          return;
+        }
+        if (game.projectiles.some(pr => pr.kind === 'boomerang')) return;
+        const d = getDirVec(p.dir);
+        sound.sfxSword();
+        game.projectiles.push({
+          fromPlayer: true,
+          kind: 'boomerang',
+          x: p.x + p.w / 2 - 8,
+          y: p.y + p.h / 2 - 8,
+          w: 16, h: 16,
+          vx: d.x * 240,
+          vy: d.y * 240,
+          returning: false,
+          timer: 0.42,
+          dmg: 1,
+          life: 3.0
+        });
+      } else if (p.equippedItem === 'flame') {
+        if (!p.hasFlame) {
+          showToast('尚未獲得秘寶【火焰】！', 2.0);
+          return;
+        }
+        if (p.flameCooldown > 0) {
+          showToast(`火焰冷卻中 (${p.flameCooldown.toFixed(1)}秒)...`, 1.2);
+          return;
+        }
+        // 射出一排密集火焰，冷卻 3 秒
+        p.flameCooldown = 3.0;
+        sound.sfxFlame();
+        const d = getDirVec(p.dir);
+        const perpX = -d.y;
+        const perpY = d.x;
+        for (let i = -3; i <= 3; i++) {
+          const offset = i * 18;
+          game.projectiles.push({
+            fromPlayer: true,
+            kind: 'flameWave',
+            x: p.x + p.w / 2 - 8 + d.x * 16 + perpX * offset,
+            y: p.y + p.h / 2 - 8 + d.y * 16 + perpY * offset,
+            w: 16, h: 16,
+            vx: d.x * 210,
+            vy: d.y * 210,
+            dmg: 3,
+            pierce: true,
+            hitIds: new Set(),
+            life: 0.85
+          });
+        }
+      } else if (p.equippedItem === 'bow') {
+        fireBow();
+      }
+    }
+
+    function fireBow() {
+      const p = game.player;
+      if (!p.equippedBow || p.ownedBows.length === 0) {
+        showToast('尚未擁有任何弓！', 1.8);
+        return;
+      }
+      if (p.bowCooldown > 0) return;
+
+      // 若選中的特殊箭數量為 0，自動退回普通箭
+      let arrowType = p.equippedArrow;
+      if (arrowType !== 'normal') {
+        if (p.arrows[arrowType] <= 0) {
+          p.equippedArrow = 'normal';
+          arrowType = 'normal';
+          showToast('特殊箭已用盡，自動切換為普通箭！', 1.8);
+        } else {
+          p.arrows[arrowType]--;
+        }
+      }
+
+      const bow = BOWS[p.equippedBow];
+      const arr = ARROWS[arrowType];
+      p.bowCooldown = 0.28;
+      sound.sfxBow();
+
+      const d = getDirVec(p.dir);
+      const baseAngle = Math.atan2(d.y, d.x);
+      const angles = arrowType === 'light' ? [baseAngle - 0.26, baseAngle, baseAngle + 0.26] : [baseAngle];
+      const speed = arrowType === 'light' ? 320 : 280;
+
+      for (const ang of angles) {
+        game.projectiles.push({
+          fromPlayer: true,
+          kind: 'arrow',
+          arrowType,
+          homing: bow.homing,
+          pierce: arrowType === 'light',
+          pierceWalls: arrowType === 'light',
+          hitIds: new Set(),
+          x: p.x + p.w / 2 - 5,
+          y: p.y + p.h / 2 - 5,
+          w: 10, h: 10,
+          vx: Math.cos(ang) * speed,
+          vy: Math.sin(ang) * speed,
+          dmg: bow.dmg + (arrowType === 'fire' ? 1 : arrowType === 'explosive' ? 3 : 0),
+          color: arr.color,
+          bowColor: bow.color,
+          life: 1.5
+        });
+      }
+    }
+
+    function switchItemSlot(slot) {
+      const p = game.player;
+      if (slot === 1) { p.equippedItem = 'bomb'; showToast('裝備：炸彈', 1.2); }
+      else if (slot === 2) { p.equippedItem = 'potion'; showToast('裝備：生命藥水', 1.2); }
+      else if (slot === 3) {
+        if (!p.hasBoomerang) { showToast('尚未獲得迴力鏢', 1.4); return; }
+        p.equippedItem = 'boomerang'; showToast('裝備：迴力鏢', 1.2);
+      } else if (slot === 4) {
+        if (!p.hasFlame) { showToast('尚未獲得秘寶【火焰】', 1.4); return; }
+        p.equippedItem = 'flame'; showToast('裝備：火焰 (冷卻3秒)', 1.2);
+      } else if (slot === 5) {
+        if (p.ownedBows.length === 0) { showToast('尚未獲得任何弓', 1.4); return; }
+        p.equippedItem = 'bow';
+        showToast(`裝備：${BOWS[p.equippedBow].name} (${ARROWS[p.equippedArrow].name})`, 1.5);
+      }
+      sound.sfxMenuSelect();
+    }
+
+    function cycleBow() {
+      const p = game.player;
+      if (p.ownedBows.length === 0) {
+        showToast('尚未擁有弓！', 1.6);
+        return;
+      }
+      const idx = p.ownedBows.indexOf(p.equippedBow);
+      p.equippedBow = p.ownedBows[(idx + 1) % p.ownedBows.length];
+      p.equippedItem = 'bow';
+      sound.sfxMenuSelect();
+      showToast(`切換弓種：【${BOWS[p.equippedBow].name}】`, 1.6);
+    }
+
+    function cycleArrow() {
+      const p = game.player;
+      if (p.ownedBows.length === 0) {
+        showToast('尚未擁有弓！', 1.6);
+        return;
+      }
+      const available = ['normal', ...ARROW_ORDER.filter(a => a !== 'normal' && p.arrows[a] > 0)];
+      const idx = available.indexOf(p.equippedArrow);
+      p.equippedArrow = available[(idx + 1) % available.length];
+      p.equippedItem = 'bow';
+      sound.sfxMenuSelect();
+      const cnt = p.equippedArrow === 'normal' ? '∞' : p.arrows[p.equippedArrow];
+      showToast(`切換箭矢：【${ARROWS[p.equippedArrow].name}】(${cnt})`, 1.6);
+    }
+
+    // =========================================================================
+    // 9. 傷害、爆炸、掉落物與敵人 AI
+    // =========================================================================
+    function damagePlayer(amount, fromX, fromY) {
+      const p = game.player;
+      if (p.invuln > 0 || game.state !== 'PLAYING') return;
+
+      p.hp = Math.max(0, p.hp - amount);
+      p.invuln = 1.05;
+      sound.sfxHurt();
+      spawnParticles(p.x + p.w / 2, p.y + p.h / 2, '#ef4444', 10, 90);
+      addFloatingText(p.x + p.w / 2, p.y - 6, `-${amount}`, '#ef4444');
+
+      const ang = Math.atan2((p.y + p.h / 2) - fromY, (p.x + p.w / 2) - fromX);
+      p.knockVx = Math.cos(ang) * 190;
+      p.knockVy = Math.sin(ang) * 190;
+
+      if (p.hp <= 0) {
+        game.state = 'GAMEOVER';
+      }
+    }
+
+    function damageEnemy(e, amount, fromX, fromY, status = null) {
+      if (e.hp <= 0) return;
+      e.hp -= amount;
+      e.hurtTimer = 0.14;
+      sound.sfxHit();
+      spawnParticles(e.x + e.w / 2, e.y + e.h / 2, '#facc15', 6, 70);
+      addFloatingText(e.x + e.w / 2, e.y - 4, `-${amount}`, '#fef08a');
+
+      if (!e.boss) {
+        const ang = Math.atan2((e.y + e.h / 2) - fromY, (e.x + e.w / 2) - fromX);
+        e.knockVx = Math.cos(ang) * 180;
+        e.knockVy = Math.sin(ang) * 180;
+      }
+
+      if (status === 'stun' && !e.boss) {
+        e.stunTimer = 2.0;
+      } else if (status === 'burn') {
+        e.burnTimer = 4.0;
+        e.burnTick = 0.8;
+      } else if (status === 'poison') {
+        e.poisonTimer = 6.0;
+        e.poisonTick = 0.9;
+      }
+
+      if (e.hp <= 0) {
+        killEnemy(e);
+      }
+    }
+
+    function killEnemy(e) {
+      sound.sfxKill();
+      spawnParticles(e.x + e.w / 2, e.y + e.h / 2, e.boss ? '#f97316' : '#e2e8f0', e.boss ? 36 : 14, e.boss ? 150 : 90);
+
+      if (e.type === 'dragon') {
+        game.bossDefeated = true;
+        game.player.rupees += 60;
+        game.player.relicShards++;
+        sound.sfxChest();
+        showToast('擊敗【火焰魔龍】！獲得 60 盧比！快回席格王宮向公主報告領取秘寶【火焰】！', 5.5);
+        return;
+      }
+
+      if (e.type === 'zaimie') {
+        game.zaimieDefeated = true;
+        sound.sfxSecret();
+        game.state = 'VICTORY';
+        return;
+      }
+
+      // 一般掉落物
+      const r = Math.random();
+      if (r < 0.35) {
+        game.drops.push({ type: 'rupee', x: e.x + 4, y: e.y + 4, life: 12 });
+      } else if (r < 0.55) {
+        game.drops.push({ type: 'rupeeBlue', x: e.x + 4, y: e.y + 4, life: 12 });
+      } else if (r < 0.78) {
+        game.drops.push({ type: 'heart', x: e.x + 4, y: e.y + 4, life: 12 });
+      }
+
+      // 迷霧森林清光敵人掉落古代鑰匙
+      const room = getCurrentRoom();
+      const remaining = game.enemies.filter(en => en.hp > 0);
+      if (room.clearDropsKey && !room.keyDropped && remaining.length === 0) {
+        room.keyDropped = true;
+        sound.sfxSecret();
+        game.drops.push({ type: 'key', x: 7.5 * TILE_SIZE, y: 6 * TILE_SIZE, life: 999 });
+        showToast('迷霧森林的魔物全滅了！中央出現了【古代鑰匙】！', 3.6);
+      }
+    }
+
+    function explodeAt(cx, cy, radius = 56, dmg = 5) {
+      sound.sfxBomb();
+      spawnParticles(cx, cy, '#f97316', 20, 140);
+      spawnParticles(cx, cy, '#facc15', 14, 100);
+
+      // 炸毀範圍內裂縫牆壁
+      const room = getCurrentRoom();
+      for (let ty = 0; ty < MAP_ROWS; ty++) {
+        for (let tx = 0; tx < MAP_COLS; tx++) {
+          if (room.grid[ty][tx] === T.CRACKED) {
+            const dist = Math.hypot(tx * TILE_SIZE + 16 - cx, ty * TILE_SIZE + 16 - cy);
+            if (dist < radius + 16) {
+              room.grid[ty][tx] = T.PATH;
+              sound.sfxSecret();
+              spawnParticles(tx * TILE_SIZE + 16, ty * TILE_SIZE + 16, '#94a3b8', 16, 110);
+              showToast('轟隆！裂縫岩壁被炸開了！', 2.8);
+            }
+          }
+        }
+      }
+
+      // 對範圍內敵人造成高傷害
+      for (const e of game.enemies) {
+        if (e.hp <= 0) continue;
+        const dist = Math.hypot(e.x + e.w / 2 - cx, e.y + e.h / 2 - cy);
+        if (dist < radius + e.w / 2) {
+          damageEnemy(e, dmg, cx, cy);
+        }
+      }
+    }
+
+    function collectDrop(d) {
+      const p = game.player;
+      if (d.type === 'rupee') {
+        p.rupees += 5;
+        sound.sfxRupee();
+        addFloatingText(p.x + 11, p.y - 6, '+5', '#4ade80');
+      } else if (d.type === 'rupeeBlue') {
+        p.rupees += 15;
+        sound.sfxRupee();
+        addFloatingText(p.x + 11, p.y - 6, '+15', '#38bdf8');
+      } else if (d.type === 'heart') {
+        p.hp = Math.min(p.maxHp, p.hp + 2);
+        sound.sfxHeart();
+        addFloatingText(p.x + 11, p.y - 6, '+2 HP', '#f472b6');
+      } else if (d.type === 'key') {
+        p.keys++;
+        sound.sfxChest();
+        addFloatingText(p.x + 11, p.y - 6, '古代鑰匙!', '#facc15');
+        showToast('獲得了【古代鑰匙】！可開啟北方古代遺跡西側大門！', 3.8);
+      }
+    }
+
+    // =========================================================================
+    // 10. 主更新迴圈 (物理、AI、小遊戲、投射物)
+    // =========================================================================
+    function update(dt) {
+      game.time += dt;
+      if (game.toast.timer > 0) game.toast.timer = Math.max(0, game.toast.timer - dt);
+
+      if (game.state === 'TRANSITION') {
+        const tr = game.transition;
+        tr.progress += dt / tr.duration;
+        if (tr.progress >= 1) {
+          enterRoom(tr.nextRx, tr.nextRy, false);
+          const p = game.player;
+          if (tr.dx > 0)      { p.x = 1.15 * TILE_SIZE; p.y = 6 * TILE_SIZE; }
+          else if (tr.dx < 0) { p.x = (MAP_COLS - 2.15) * TILE_SIZE; p.y = 6 * TILE_SIZE; }
+          else if (tr.dy > 0) { p.x = 7.5 * TILE_SIZE; p.y = 1.15 * TILE_SIZE; }
+          else if (tr.dy < 0) { p.x = 7.5 * TILE_SIZE; p.y = (MAP_ROWS - 2.15) * TILE_SIZE; }
+          game.transition = null;
+          game.state = 'PLAYING';
+        }
+        return;
+      }
+
+      if (game.state !== 'PLAYING') return;
+
+      game.playTime += dt;
+      const room = getCurrentRoom();
+      sound.updateBgm(dt, room.bgm || 'OVERWORLD');
+
+      updatePlayer(dt, room);
+      updateMinigame(dt);
+      updateEnemies(dt, room);
+      updateProjectiles(dt, room);
+      updateBombs(dt);
+      updateDrops(dt);
+      updateParticlesAndTexts(dt);
+    }
+
+    function updatePlayer(dt, room) {
+      const p = game.player;
+      if (p.invuln > 0) p.invuln = Math.max(0, p.invuln - dt);
+      if (p.attackTimer > 0) p.attackTimer = Math.max(0, p.attackTimer - dt);
+      if (p.attackCooldown > 0) p.attackCooldown = Math.max(0, p.attackCooldown - dt);
+      if (p.flameCooldown > 0) p.flameCooldown = Math.max(0, p.flameCooldown - dt);
+      if (p.bowCooldown > 0) p.bowCooldown = Math.max(0, p.bowCooldown - dt);
+
+      let mx = 0, my = 0;
+      if (keys['KeyW'] || keys['ArrowUp'])    my -= 1;
+      if (keys['KeyS'] || keys['ArrowDown'])  my += 1;
+      if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
+      if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+
+      if (mx !== 0 || my !== 0) {
+        const len = Math.hypot(mx, my);
+        mx /= len; my /= len;
+        if (Math.abs(mx) > Math.abs(my)) p.dir = mx < 0 ? 'left' : 'right';
+        else p.dir = my < 0 ? 'up' : 'down';
+        p.walkAnim += dt * 8;
+      }
+
+      const vx = mx * p.speed + p.knockVx;
+      const vy = my * p.speed + p.knockVy;
+      p.knockVx *= Math.pow(0.001, dt);
+      p.knockVy *= Math.pow(0.001, dt);
+
+      const allowExit = !game.minigame.active;
+
+      const nx = p.x + vx * dt;
+      if (!collidesWithMap(room, nx, p.y, p.w, p.h, allowExit)) {
+        p.x = nx;
+      }
+      const ny = p.y + vy * dt;
+      if (!collidesWithMap(room, p.x, ny, p.w, p.h, allowExit)) {
+        p.y = ny;
+      }
+
+      // 檢查進出隱藏洞穴商店
+      const cx = p.x + p.w / 2;
+      const cy = p.y + p.h / 2;
+      const tileHere = getTileAt(room, Math.floor(cx / TILE_SIZE), Math.floor(cy / TILE_SIZE));
+      const tileFeet = getTileAt(room, Math.floor(cx / TILE_SIZE), Math.floor((p.y + p.h) / TILE_SIZE));
+      if (!game.inSecretShop && tileHere === T.CAVE_DOOR) {
+        sound.sfxRoomChange();
+        enterRoom(1, 1, true);
+        p.x = 7.5 * TILE_SIZE;
+        p.y = (MAP_ROWS - 2.3) * TILE_SIZE;
+        p.dir = 'up';
+        return;
+      }
+      if (game.inSecretShop && (tileHere === T.CAVE_EXIT || tileFeet === T.CAVE_EXIT || cy > PLAY_H - 12)) {
+        sound.sfxRoomChange();
+        enterRoom(1, 1, false);
+        p.x = 2 * TILE_SIZE + 5;
+        p.y = 3.2 * TILE_SIZE;
+        p.dir = 'down';
+        return;
+      }
+
+      // 4x4 邊界順暢切圖判定
+      if (!game.inSecretShop && !game.minigame.active) {
+        if (cx < 8 && room.exits.w)            startRoomTransition(-1, 0);
+        else if (cx > PLAY_W - 8 && room.exits.e) startRoomTransition(1, 0);
+        else if (cy < 8 && room.exits.n)       startRoomTransition(0, -1);
+        else if (cy > PLAY_H - 8 && room.exits.s) startRoomTransition(0, 1);
+      }
+
+      // 防止走入未開放邊界外 (隱藏洞穴由牆壁磚塊阻擋，不限制南方出口)
+      if (game.minigame.active) {
+        p.x = Math.max(TILE_SIZE, Math.min(PLAY_W - TILE_SIZE - p.w, p.x));
+        p.y = Math.max(TILE_SIZE, Math.min(PLAY_H - TILE_SIZE - p.h, p.y));
+      } else if (game.inSecretShop) {
+        p.x = Math.max(TILE_SIZE, Math.min(PLAY_W - TILE_SIZE - p.w, p.x));
+        p.y = Math.max(TILE_SIZE, Math.min(PLAY_H - p.h, p.y));
+      }
+    }
+
+    function updateMinigame(dt) {
+      const mg = game.minigame;
+      if (!mg.active) return;
+
+      mg.timer -= dt;
+      mg.spawnTimer -= dt;
+      if (mg.spawnTimer <= 0 && mg.targets.length < 4) {
+        mg.spawnTimer = 0.75;
+        const fromLeft = Math.random() < 0.5;
+        const lane = Math.floor(Math.random() * 2);
+        mg.targets.push({
+          x: fromLeft ? TILE_SIZE : PLAY_W - TILE_SIZE - 24,
+          y: (1.4 + lane * 1.1) * TILE_SIZE,
+          w: 24, h: 24,
+          vx: (fromLeft ? 1 : -1) * (105 + Math.random() * 75)
+        });
+      }
+
+      for (let i = mg.targets.length - 1; i >= 0; i--) {
+        const tg = mg.targets[i];
+        tg.x += tg.vx * dt;
+        if (tg.x < TILE_SIZE - 10 || tg.x > PLAY_W - TILE_SIZE + 10) {
+          mg.targets.splice(i, 1);
+        }
+      }
+
+      if (mg.timer <= 0) {
+        mg.active = false;
+        mg.targets = [];
+        let prize = 0;
+        if (mg.score >= 10) prize = 70;
+        else if (mg.score >= 5) prize = 30;
+        if (prize > 0) {
+          game.player.rupees += prize;
+          sound.sfxChest();
+          showToast(`打靶結束！連恩命中 ${mg.score} 分，獲得獎金 ${prize} 盧比！`, 4.0);
+        } else {
+          sound.sfxMenuSelect();
+          showToast(`打靶結束！命中 ${mg.score} 分（達 5 分即可領獎），再接再厲！`, 3.4);
+        }
+      }
+    }
+
+    function updateEnemies(dt, room) {
+      const p = game.player;
+
+      for (let i = game.enemies.length - 1; i >= 0; i--) {
+        const e = game.enemies[i];
+        if (e.hp <= 0) {
+          game.enemies.splice(i, 1);
+          continue;
+        }
+
+        if (e.hurtTimer > 0) e.hurtTimer -= dt;
+        if (e.stunTimer > 0) { e.stunTimer -= dt; continue; }
+
+        // 依實體類型推進走路 / 振翅動畫計時
+        e.animTime += dt * (e.type === 'bat' ? 10 : e.boss ? 5.5 : 6.5);
+
+        // 燃燒與中毒持續傷害
+        if (e.burnTimer > 0) {
+          e.burnTimer -= dt;
+          e.burnTick -= dt;
+          if (e.burnTick <= 0) {
+            e.burnTick = 0.85;
+            spawnParticles(e.x + e.w / 2, e.y + e.h / 2, '#f97316', 5, 50);
+            damageEnemy(e, 1, e.x, e.y);
+            if (e.hp <= 0) continue;
+          }
+        }
+        if (e.poisonTimer > 0) {
+          e.poisonTimer -= dt;
+          e.poisonTick -= dt;
+          if (e.poisonTick <= 0) {
+            e.poisonTick = 0.95;
+            spawnParticles(e.x + e.w / 2, e.y + e.h / 2, '#a855f7', 5, 45);
+            damageEnemy(e, 1, e.x, e.y);
+            if (e.hp <= 0) continue;
+          }
+        }
+
+        // Boss AI
+        if (e.type === 'dragon') {
+          updateDragonBoss(e, dt);
+        } else if (e.type === 'zaimie') {
+          updateZaimieBoss(e, dt);
+        } else {
+          // 一般敵人 AI
+          e.aiTimer -= dt;
+          if (e.aiTimer <= 0) {
+            e.aiTimer = 0.9 + Math.random() * 1.1;
+            if (Math.random() < 0.55) {
+              const ang = Math.atan2(p.y - e.y, p.x - e.x);
+              e.dirX = Math.cos(ang);
+              e.dirY = Math.sin(ang);
+            } else {
+              const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+              const pick = dirs[Math.floor(Math.random() * 4)];
+              e.dirX = pick[0]; e.dirY = pick[1];
+            }
+          }
+
+          const vx = e.dirX * e.speed + e.knockVx;
+          const vy = e.dirY * e.speed + e.knockVy;
+          e.knockVx *= Math.pow(0.001, dt);
+          e.knockVy *= Math.pow(0.001, dt);
+
+          const nx = e.x + vx * dt;
+          if (e.fly || !collidesWithMap(room, nx, e.y, e.w, e.h, false)) {
+            e.x = Math.max(TILE_SIZE, Math.min(PLAY_W - TILE_SIZE - e.w, nx));
+          } else {
+            e.dirX *= -1;
+          }
+          const ny = e.y + vy * dt;
+          if (e.fly || !collidesWithMap(room, e.x, ny, e.w, e.h, false)) {
+            e.y = Math.max(TILE_SIZE, Math.min(PLAY_H - TILE_SIZE - e.h, ny));
+          } else {
+            e.dirY *= -1;
+          }
+
+          // 遠程敵人射擊
+          if (e.shoot) {
+            e.shootTimer -= dt;
+            if (e.shootTimer <= 0) {
+              e.shootTimer = e.type === 'darkKnight' ? 1.8 : 2.3;
+              const ang = Math.atan2((p.y + p.h / 2) - (e.y + e.h / 2), (p.x + p.w / 2) - (e.x + e.w / 2));
+              game.projectiles.push({
+                fromPlayer: false,
+                kind: 'enemyShot',
+                x: e.x + e.w / 2 - 5,
+                y: e.y + e.h / 2 - 5,
+                w: 10, h: 10,
+                vx: Math.cos(ang) * 150,
+                vy: Math.sin(ang) * 150,
+                dmg: e.dmg,
+                color: e.type === 'darkKnight' ? '#a855f7' : '#f97316',
+                life: 2.5
+              });
+            }
+          }
+        }
+
+        // 接觸玩家傷害
+        if (rectOverlap(p, e)) {
+          damagePlayer(e.dmg, e.x + e.w / 2, e.y + e.h / 2);
+        }
+      }
+    }
+
+    function updateDragonBoss(e, dt) {
+      const p = game.player;
+      e.aiTimer -= dt;
+      if (e.aiTimer <= 0) {
+        e.aiTimer = 1.6;
+        const ang = Math.atan2(p.y - e.y, p.x - e.x);
+        e.dirX = Math.cos(ang);
+        e.dirY = Math.sin(ang);
+      }
+
+      e.x = Math.max(TILE_SIZE * 1.2, Math.min(PLAY_W - TILE_SIZE * 1.2 - e.w, e.x + e.dirX * e.speed * dt));
+      e.y = Math.max(TILE_SIZE * 1.2, Math.min(PLAY_H - TILE_SIZE * 1.2 - e.h, e.y + e.dirY * e.speed * dt));
+
+      e.shootTimer -= dt;
+      if (e.shootTimer <= 0) {
+        e.shootTimer = 1.75;
+        const base = Math.atan2((p.y + p.h / 2) - (e.y + e.h / 2), (p.x + p.w / 2) - (e.x + e.w / 2));
+        for (const spread of [-0.32, 0, 0.32]) {
+          game.projectiles.push({
+            fromPlayer: false,
+            kind: 'fireball',
+            x: e.x + e.w / 2 - 6,
+            y: e.y + e.h / 2 - 6,
+            w: 12, h: 12,
+            vx: Math.cos(base + spread) * 165,
+            vy: Math.sin(base + spread) * 165,
+            dmg: 2,
+            color: '#f97316',
+            life: 3.0
+          });
+        }
+      }
+    }
+
+    function updateZaimieBoss(e, dt) {
+      const p = game.player;
+      if (!e.phase2 && e.hp <= e.maxHp * 0.5) {
+        e.phase2 = true;
+        e.speed = 104;
+        sound.sfxBossRoar();
+        spawnParticles(e.x + e.w / 2, e.y + e.h / 2, '#a855f7', 28, 160);
+        showToast('【災滅】進入狂暴第二階段！彈幕變得更加猛烈！', 3.2);
+      }
+
+      e.aiTimer -= dt;
+      if (e.aiTimer <= 0) {
+        e.aiTimer = e.phase2 ? 0.95 : 1.35;
+        const ang = Math.atan2(p.y - e.y, p.x - e.x);
+        e.dirX = Math.cos(ang);
+        e.dirY = Math.sin(ang);
+      }
+
+      e.x = Math.max(TILE_SIZE * 1.2, Math.min(PLAY_W - TILE_SIZE * 1.2 - e.w, e.x + e.dirX * e.speed * dt));
+      e.y = Math.max(TILE_SIZE * 1.2, Math.min(PLAY_H - TILE_SIZE * 1.2 - e.h, e.y + e.dirY * e.speed * dt));
+
+      e.shootTimer -= dt;
+      if (e.shootTimer <= 0) {
+        e.shootTimer = e.phase2 ? 1.15 : 1.55;
+        e.attackCycle = (e.attackCycle + 1) % 3;
+        const cx = e.x + e.w / 2 - 6;
+        const cy = e.y + e.h / 2 - 6;
+
+        if (e.attackCycle === 0) {
+          // 8 向暗黑新星彈幕
+          const count = e.phase2 ? 10 : 8;
+          for (let i = 0; i < count; i++) {
+            const ang = (Math.PI * 2 * i) / count + game.time;
+            game.projectiles.push({
+              fromPlayer: false, kind: 'darkOrb',
+              x: cx, y: cy, w: 12, h: 12,
+              vx: Math.cos(ang) * 155, vy: Math.sin(ang) * 155,
+              dmg: 2, color: '#a855f7', life: 3.2
+            });
+          }
+        } else if (e.attackCycle === 1) {
+          // 五向瞄準暗影連射
+          const base = Math.atan2((p.y + p.h / 2) - cy, (p.x + p.w / 2) - cx);
+          const spreads = e.phase2 ? [-0.4, -0.2, 0, 0.2, 0.4] : [-0.25, 0, 0.25];
+          for (const sp of spreads) {
+            game.projectiles.push({
+              fromPlayer: false, kind: 'darkOrb',
+              x: cx, y: cy, w: 12, h: 12,
+              vx: Math.cos(base + sp) * 205, vy: Math.sin(base + sp) * 205,
+              dmg: 2, color: '#ef4444', life: 2.8
+            });
+          }
+        } else {
+          // 暗影瞬移 + 四向衝擊彈
+          e.x = (2 + Math.random() * 10) * TILE_SIZE;
+          e.y = (2 + Math.random() * 7) * TILE_SIZE;
+          spawnParticles(e.x + e.w / 2, e.y + e.h / 2, '#c084fc', 18, 120);
+          for (let i = 0; i < 4; i++) {
+            const ang = (Math.PI / 2) * i + Math.PI / 4;
+            game.projectiles.push({
+              fromPlayer: false, kind: 'darkOrb',
+              x: e.x + e.w / 2 - 6, y: e.y + e.h / 2 - 6, w: 12, h: 12,
+              vx: Math.cos(ang) * 175, vy: Math.sin(ang) * 175,
+              dmg: 2, color: '#f43f5e', life: 2.8
+            });
+          }
+        }
+      }
+    }
+
+    function updateProjectiles(dt, room) {
+      const p = game.player;
+
+      for (let i = game.projectiles.length - 1; i >= 0; i--) {
+        const pr = game.projectiles[i];
+        pr.life -= dt;
+        if (pr.life <= 0) {
+          game.projectiles.splice(i, 1);
+          continue;
+        }
+
+        // 迴力鏢往返與回收掉落物
+        if (pr.kind === 'boomerang') {
+          if (!pr.returning) {
+            pr.timer -= dt;
+            if (pr.timer <= 0) pr.returning = true;
+          } else {
+            const ang = Math.atan2((p.y + p.h / 2) - pr.y, (p.x + p.w / 2) - pr.x);
+            pr.vx = Math.cos(ang) * 270;
+            pr.vy = Math.sin(ang) * 270;
+            if (Math.hypot((p.x + p.w / 2) - pr.x, (p.y + p.h / 2) - pr.y) < 18) {
+              game.projectiles.splice(i, 1);
+              continue;
+            }
+          }
+          // 回收掉落物
+          for (let j = game.drops.length - 1; j >= 0; j--) {
+            const d = game.drops[j];
+            if (Math.hypot(d.x - pr.x, d.y - pr.y) < 24) {
+              collectDrop(d);
+              game.drops.splice(j, 1);
+            }
+          }
+        }
+
+        // 追獵弓追蹤最近敵人
+        if (pr.kind === 'arrow' && pr.homing && game.enemies.length > 0) {
+          let nearest = null;
+          let minD = 9999;
+          for (const e of game.enemies) {
+            if (e.hp <= 0) continue;
+            const d = Math.hypot((e.x + e.w / 2) - pr.x, (e.y + e.h / 2) - pr.y);
+            if (d < minD) { minD = d; nearest = e; }
+          }
+          if (nearest) {
+            const curAng = Math.atan2(pr.vy, pr.vx);
+            const targetAng = Math.atan2((nearest.y + nearest.h / 2) - pr.y, (nearest.x + nearest.w / 2) - pr.x);
+            let diff = targetAng - curAng;
+            while (diff > Math.PI) diff -= Math.PI * 2;
+            while (diff < -Math.PI) diff += Math.PI * 2;
+            const newAng = curAng + Math.max(-7 * dt, Math.min(7 * dt, diff));
+            const spd = Math.hypot(pr.vx, pr.vy);
+            pr.vx = Math.cos(newAng) * spd;
+            pr.vy = Math.sin(newAng) * spd;
+          }
+        }
+
+        pr.x += pr.vx * dt;
+        pr.y += pr.vy * dt;
+
+        // 邊界檢查
+        if (pr.x < -16 || pr.x > PLAY_W + 16 || pr.y < -16 || pr.y > PLAY_H + 16) {
+          game.projectiles.splice(i, 1);
+          continue;
+        }
+
+        // 地形碰撞 (光箭、迴力鏢、火焰波可穿透障礙；練習箭跨欄)
+        const ignoreWall = pr.pierceWalls || pr.kind === 'boomerang' || pr.kind === 'flameWave' || pr.kind === 'practiceBolt';
+        if (!ignoreWall && collidesWithMap(room, pr.x, pr.y, pr.w, pr.h, false)) {
+          if (pr.kind === 'arrow' && pr.arrowType === 'explosive') {
+            explodeAt(pr.x + 5, pr.y + 5, 52, 4);
+          } else {
+            spawnParticles(pr.x + 4, pr.y + 4, pr.color || '#facc15', 4, 50);
+          }
+          game.projectiles.splice(i, 1);
+          continue;
+        }
+
+        // 打靶小遊戲命中判定
+        if (pr.kind === 'practiceBolt' && game.minigame.active) {
+          let hitTarget = false;
+          for (let j = game.minigame.targets.length - 1; j >= 0; j--) {
+            const tg = game.minigame.targets[j];
+            if (rectOverlap(pr, tg)) {
+              game.minigame.targets.splice(j, 1);
+              game.minigame.score++;
+              sound.sfxTargetHit();
+              spawnParticles(tg.x + 12, tg.y + 12, '#facc15', 10, 90);
+              addFloatingText(tg.x + 12, tg.y, '+1分!', '#4ade80');
+              hitTarget = true;
+              break;
+            }
+          }
+          if (hitTarget) {
+            game.projectiles.splice(i, 1);
+            continue;
+          }
+        }
+
+        // 玩家投射物命中敵人
+        if (pr.fromPlayer) {
+          let consumed = false;
+          for (const e of game.enemies) {
+            if (e.hp <= 0) continue;
+            if (pr.pierce && pr.hitIds && pr.hitIds.has(e)) continue;
+            if (rectOverlap(pr, e)) {
+              let status = null;
+              if (pr.kind === 'boomerang') status = 'stun';
+              else if (pr.kind === 'arrow' && pr.arrowType === 'fire') status = 'burn';
+              else if (pr.kind === 'arrow' && pr.arrowType === 'poison') status = 'poison';
+
+              damageEnemy(e, pr.dmg, pr.x + pr.w / 2, pr.y + pr.h / 2, status);
+
+              if (pr.kind === 'arrow' && pr.arrowType === 'explosive') {
+                explodeAt(pr.x + pr.w / 2, pr.y + pr.h / 2, 54, 4);
+              }
+
+              if (pr.pierce && pr.hitIds) {
+                pr.hitIds.add(e);
+              } else if (pr.kind === 'boomerang') {
+                pr.returning = true;
+              } else {
+                consumed = true;
+                break;
+              }
+            }
+          }
+          if (consumed) {
+            game.projectiles.splice(i, 1);
+            continue;
+          }
+        } else {
+          // 敵人彈幕命中玩家
+          if (rectOverlap(pr, p)) {
+            damagePlayer(pr.dmg, pr.x + pr.w / 2, pr.y + pr.h / 2);
+            game.projectiles.splice(i, 1);
+            continue;
+          }
+        }
+      }
+    }
+
+    function updateBombs(dt) {
+      for (let i = game.bombs.length - 1; i >= 0; i--) {
+        const b = game.bombs[i];
+        b.timer -= dt;
+        if (b.timer <= 0) {
+          explodeAt(b.x + 8, b.y + 8, 56, 5);
+          game.bombs.splice(i, 1);
+        }
+      }
+    }
+
+    function updateDrops(dt) {
+      const p = game.player;
+      for (let i = game.drops.length - 1; i >= 0; i--) {
+        const d = game.drops[i];
+        d.life -= dt;
+        if (d.life <= 0) {
+          game.drops.splice(i, 1);
+          continue;
+        }
+        if (Math.hypot((p.x + p.w / 2) - (d.x + 8), (p.y + p.h / 2) - (d.y + 8)) < 22) {
+          collectDrop(d);
+          game.drops.splice(i, 1);
+        }
+      }
+    }
+
+    function updateParticlesAndTexts(dt) {
+      for (let i = game.particles.length - 1; i >= 0; i--) {
+        const pt = game.particles[i];
+        pt.x += pt.vx * dt;
+        pt.y += pt.vy * dt;
+        pt.life -= dt;
+        if (pt.life <= 0) game.particles.splice(i, 1);
+      }
+
+      for (let i = game.floatingTexts.length - 1; i >= 0; i--) {
+        const ft = game.floatingTexts[i];
+        ft.y -= 28 * dt;
+        ft.life -= dt;
+        if (ft.life <= 0) game.floatingTexts.splice(i, 1);
+      }
+
+      for (const f of game.fairies) {
+        f.angle += dt * 1.9;
+      }
+    }
+
+    // =========================================================================
+    // 11. 極簡粗顆粒 8-Bit 像素繪圖引擎
+    // =========================================================================
+    function drawTile(tile, tx, ty, ox, oy) {
+      const x = ox + tx * TILE_SIZE;
+      const y = oy + ty * TILE_SIZE;
+      const S = TILE_SIZE;
+
+      switch (tile) {
+        case T.GRASS:
+          ctx.fillStyle = '#4ade80';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#22c55e';
+          ctx.fillRect(x + 4, y + 8, 4, 4);
+          ctx.fillRect(x + 20, y + 20, 4, 4);
+          break;
+
+        case T.PATH:
+          ctx.fillStyle = '#eab308';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#ca8a04';
+          ctx.fillRect(x + 4, y + 4, 4, 4);
+          ctx.fillRect(x + 20, y + 24, 4, 4);
+          break;
+
+        case T.TREE:
+          ctx.fillStyle = '#15803d';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#166534';
+          ctx.fillRect(x + 4, y + 4, 24, 20);
+          ctx.fillStyle = '#22c55e';
+          ctx.fillRect(x + 8, y + 4, 12, 8);
+          ctx.fillStyle = '#78350f';
+          ctx.fillRect(x + 12, y + 24, 8, 8);
+          break;
+
+        case T.WATER: {
+          ctx.fillStyle = '#2563eb';
+          ctx.fillRect(x, y, S, S);
+          const wave = Math.floor(game.time * 3) % 2 === 0 ? 0 : 8;
+          ctx.fillStyle = '#60a5fa';
+          ctx.fillRect(x + 4 + wave, y + 8, 12, 4);
+          ctx.fillRect(x + 12 - wave, y + 20, 12, 4);
+          break;
+        }
+
+        case T.ROCK:
+        case T.SECRET_WALL:
+          ctx.fillStyle = '#64748b';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillRect(x + 4, y + 4, 20, 12);
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(x, y + 24, S, 8);
+          ctx.fillRect(x + 24, y + 4, 8, 28);
+          // 暗牆僅保留微弱閃爍亮點，不顯示任何文字提示
+          if (tile === T.SECRET_WALL && Math.sin(game.time * 4.2) > 0.55) {
+            ctx.fillStyle = '#fef08a';
+            ctx.fillRect(x + 12, y + 12, 4, 4);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(x + 16, y + 8, 4, 4);
+          }
+          break;
+
+        case T.CRACKED:
+          ctx.fillStyle = '#64748b';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(x, y + 24, S, 8);
+          // 明顯像素裂縫
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(x + 12, y + 4, 4, 8);
+          ctx.fillRect(x + 16, y + 12, 4, 8);
+          ctx.fillRect(x + 8, y + 16, 4, 8);
+          ctx.fillRect(x + 12, y + 20, 8, 4);
+          break;
+
+        case T.FLOOR:
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(x, y, S, 2);
+          ctx.fillRect(x, y, 2, S);
+          break;
+
+        case T.WALL:
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(x + 4, y + 4, 24, 10);
+          ctx.fillRect(x + 4, y + 18, 24, 10);
+          break;
+
+        case T.DOOR_LOCKED:
+          ctx.fillStyle = '#92400e';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x + 4, y + 4, 24, 24);
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(x + 12, y + 10, 8, 8);
+          ctx.fillRect(x + 14, y + 18, 4, 6);
+          break;
+
+        case T.TORCH: {
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#78350f';
+          ctx.fillRect(x + 12, y + 16, 8, 12);
+          const f = Math.floor(game.time * 8) % 2;
+          ctx.fillStyle = '#f97316';
+          ctx.fillRect(x + 8, y + 4 + f * 2, 16, 12);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x + 12, y + 8, 8, 8);
+          break;
+        }
+
+        case T.FLOWER:
+          ctx.fillStyle = '#4ade80';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#f472b6';
+          ctx.fillRect(x + 8, y + 8, 8, 8);
+          ctx.fillRect(x + 20, y + 16, 8, 8);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x + 10, y + 10, 4, 4);
+          ctx.fillRect(x + 22, y + 18, 4, 4);
+          break;
+
+        case T.BRIDGE:
+          ctx.fillStyle = '#92400e';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#b45309';
+          ctx.fillRect(x + 2, y + 4, 28, 6);
+          ctx.fillRect(x + 2, y + 14, 28, 6);
+          ctx.fillRect(x + 2, y + 24, 28, 6);
+          break;
+
+        case T.CARPET:
+          ctx.fillStyle = '#dc2626';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x, y, 4, S);
+          ctx.fillRect(x + S - 4, y, 4, S);
+          break;
+
+        case T.ROYAL_WALL:
+          ctx.fillStyle = '#e2e8f0';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillRect(x, y + 24, S, 8);
+          ctx.fillStyle = '#2563eb';
+          ctx.fillRect(x + 8, y + 8, 16, 12);
+          break;
+
+        case T.CAVE_DOOR:
+          ctx.fillStyle = '#64748b';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#020617';
+          ctx.fillRect(x + 4, y + 4, 24, 28);
+          break;
+
+        case T.CAVE_FLOOR:
+          ctx.fillStyle = '#292524';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#44403c';
+          ctx.fillRect(x + 8, y + 8, 4, 4);
+          ctx.fillRect(x + 20, y + 20, 4, 4);
+          break;
+
+        case T.CAVE_WALL:
+          ctx.fillStyle = '#57534e';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#1c1917';
+          ctx.fillRect(x + 4, y + 20, 24, 12);
+          break;
+
+        case T.CAVE_EXIT:
+          ctx.fillStyle = '#020617';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x + 12, y + 12, 8, 4);
+          ctx.fillRect(x + 14, y + 16, 4, 8);
+          break;
+
+        case T.RANGE_BARRIER:
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#92400e';
+          ctx.fillRect(x, y + 10, S, 12);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(x + 12, y + 14, 8, 4);
+          break;
+
+        case T.DARK_FLOOR:
+          ctx.fillStyle = '#1e1b4b';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#312e81';
+          ctx.fillRect(x + 4, y + 4, 4, 4);
+          ctx.fillRect(x + 24, y + 20, 4, 4);
+          break;
+
+        case T.DARK_WALL:
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(x, y, S, S);
+          ctx.fillStyle = '#581c87';
+          ctx.fillRect(x + 4, y + 4, 24, 24);
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(x + 8, y + 8, 16, 16);
+          break;
+      }
+    }
+
+    function drawExitArrows(room, ox, oy) {
+      if (room.isSecretShop || game.minigame.active) return;
+      if (Math.floor(game.time * 3) % 2 !== 0) return;
+      ctx.fillStyle = '#fef08a';
+      if (room.exits.n) {
+        ctx.fillRect(ox + 252, oy + 4, 8, 4);
+        ctx.fillRect(ox + 248, oy + 8, 16, 4);
+      }
+      if (room.exits.s) {
+        ctx.fillRect(ox + 248, oy + PLAY_H - 12, 16, 4);
+        ctx.fillRect(ox + 252, oy + PLAY_H - 8, 8, 4);
+      }
+      if (room.exits.w) {
+        ctx.fillRect(ox + 4, oy + 204, 4, 8);
+        ctx.fillRect(ox + 8, oy + 200, 4, 16);
+      }
+      if (room.exits.e) {
+        ctx.fillRect(ox + PLAY_W - 12, oy + 200, 4, 16);
+        ctx.fillRect(ox + PLAY_W - 8, oy + 204, 4, 8);
+      }
+    }
+
+    function drawRoom(room, ox, oy, drawDynamic) {
+      for (let ty = 0; ty < MAP_ROWS; ty++) {
+        for (let tx = 0; tx < MAP_COLS; tx++) {
+          drawTile(room.grid[ty][tx], tx, ty, ox, oy);
+        }
+      }
+
+      drawExitArrows(room, ox, oy);
+
+      // 告示牌
+      for (const sg of room.signs) {
+        const sx = ox + sg.tx * TILE_SIZE;
+        const sy = oy + sg.ty * TILE_SIZE;
+        ctx.fillStyle = '#78350f';
+        ctx.fillRect(sx + 12, sy + 18, 8, 12);
+        ctx.fillStyle = '#b45309';
+        ctx.fillRect(sx + 4, sy + 4, 24, 16);
+        ctx.fillStyle = '#fde68a';
+        ctx.fillRect(sx + 8, sy + 8, 16, 4);
+        ctx.fillRect(sx + 8, sy + 14, 12, 2);
+      }
+
+      // 寶箱
+      for (const ch of room.chests) {
+        const spr = ch.opened ? SPRITES.chestOpen : SPRITES.chestClosed;
+        ctx.drawImage(spr, ox + ch.tx * TILE_SIZE + 4, oy + ch.ty * TILE_SIZE + 4);
+      }
+
+      // 商店商品
+      for (const item of room.shopItems) {
+        const soldOut = item.onceKey && game.purchasedOnce[item.onceKey];
+        const ownedBow = item.bowId && game.player.ownedBows.includes(item.bowId);
+        const ix = ox + item.x;
+        const iy = oy + item.y;
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(ix - 8, iy - 4, 32, 34);
+        if (!soldOut) {
+          ctx.drawImage(SPRITES[item.sprite], ix, iy);
+        }
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = soldOut ? '#94a3b8' : ownedBow ? '#4ade80' : '#facc15';
+        const label = soldOut ? '售完' : ownedBow ? '已擁有' : `${item.price}元`;
+        ctx.fillText(label, ix + 8, iy + 27);
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillText(item.name, ix + 8, iy - 7);
+      }
+
+      // NPC (待機呼吸動畫)
+      for (const npc of room.npcs) {
+        const nx = ox + npc.x;
+        const ny = oy + npc.y;
+        const npcFrame2 = Math.floor(game.time * 2.4 + npc.x * 0.1) % 2 === 1;
+        const npcSpr = (npcFrame2 && SPRITES[npc.type + '2']) ? SPRITES[npc.type + '2'] : SPRITES[npc.type];
+        ctx.drawImage(npcSpr, nx, ny);
+
+        const showExclaim =
+          (npc.givesSword && game.player.swordLevel === 0) ||
+          (npc.isPrincess && !game.player.hasFlame) ||
+          (npc.isMinigameHost && !game.minigame.active);
+        if (showExclaim && Math.floor(game.time * 4) % 2 === 0) {
+          ctx.fillStyle = '#facc15';
+          ctx.font = 'bold 14px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('!', nx + 12, ny - 4);
+        }
+      }
+
+      if (!drawDynamic) return;
+
+      // 掉落物
+      for (const d of game.drops) {
+        const bob = Math.floor(Math.sin(game.time * 6) * 2);
+        const spr = d.type === 'heart' ? SPRITES.heartFull : SPRITES[d.type];
+        ctx.drawImage(spr, ox + d.x, oy + d.y + bob);
+      }
+
+      // 炸彈
+      for (const b of game.bombs) {
+        ctx.drawImage(SPRITES.bomb, ox + b.x, oy + b.y);
+        if (b.timer < 0.45 && Math.floor(game.time * 20) % 2 === 0) {
+          ctx.fillStyle = '#ef4444';
+          ctx.fillRect(ox + b.x + 2, oy + b.y + 4, 12, 10);
+        }
+      }
+
+      // 打靶移動目標
+      if (game.minigame.active) {
+        for (const tg of game.minigame.targets) {
+          ctx.drawImage(SPRITES.target, ox + tg.x, oy + tg.y);
+        }
+      }
+
+      // 妖精之泉小妖精 (拍翅動畫)
+      for (const f of game.fairies) {
+        const fx = ox + f.cx + Math.cos(f.angle) * f.radius - 8;
+        const fy = oy + f.cy + Math.sin(f.angle * 1.4) * (f.radius * 0.65) - 8;
+        const fairySpr = Math.floor(game.time * 12 + f.angle) % 2 === 1 ? SPRITES.fairy2 : SPRITES.fairy;
+        ctx.drawImage(fairySpr, fx, fy);
+      }
+
+      // 敵人與 Boss (行走 / 彈跳 / 振翅動畫)
+      let bossRef = null;
+      for (const e of game.enemies) {
+        if (e.boss) bossRef = e;
+        const ex = ox + Math.floor(e.x);
+        const ey = oy + Math.floor(e.y);
+        const stepFrame = Math.floor(e.animTime) % 2 === 1;
+        const eBob = (!e.boss && stepFrame) ? 1 : 0;
+        if (e.hurtTimer > 0 && Math.floor(game.time * 30) % 2 === 0) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(ex, ey - eBob, e.w, e.h);
+        } else {
+          const eSpr = (stepFrame && SPRITES[e.sprite + '2']) ? SPRITES[e.sprite + '2'] : SPRITES[e.sprite];
+          ctx.drawImage(eSpr, ex, ey - eBob);
+        }
+
+        // 異常狀態像素標記
+        if (e.stunTimer > 0) {
+          ctx.fillStyle = '#38bdf8';
+          ctx.fillRect(ex + 4, ey - 6, 4, 4);
+          ctx.fillRect(ex + e.w - 8, ey - 6, 4, 4);
+        }
+        if (e.burnTimer > 0) {
+          ctx.fillStyle = '#f97316';
+          ctx.fillRect(ex + 2, ey + 2, 6, 6);
+        }
+        if (e.poisonTimer > 0) {
+          ctx.fillStyle = '#a855f7';
+          ctx.fillRect(ex + e.w - 8, ey + 2, 6, 6);
+        }
+      }
+
+      // 繪製主角連恩
+      drawPlayer(ox, oy);
+
+      // 繪製投射物 (全方塊粗像素)
+      for (const pr of game.projectiles) {
+        const px = ox + Math.floor(pr.x);
+        const py = oy + Math.floor(pr.y);
+        if (pr.kind === 'boomerang') {
+          ctx.drawImage(SPRITES.boomerang, px, py);
+        } else if (pr.kind === 'flameWave') {
+          ctx.fillStyle = Math.floor(game.time * 20) % 2 === 0 ? '#f97316' : '#ef4444';
+          ctx.fillRect(px, py, 16, 16);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(px + 4, py + 4, 8, 8);
+        } else if (pr.kind === 'arrow') {
+          ctx.fillStyle = pr.color;
+          ctx.fillRect(px + 1, py + 1, 8, 8);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(px + 3, py + 3, 4, 4);
+        } else {
+          ctx.fillStyle = pr.color || '#facc15';
+          ctx.fillRect(px, py, pr.w, pr.h);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(px + 2, py + 2, Math.max(2, pr.w - 4), Math.max(2, pr.h - 4));
+        }
+      }
+
+      // 粒子特效
+      for (const pt of game.particles) {
+        ctx.fillStyle = pt.color;
+        ctx.fillRect(ox + Math.floor(pt.x), oy + Math.floor(pt.y), pt.size, pt.size);
+      }
+
+      // 飄浮數值文字
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      for (const ft of game.floatingTexts) {
+        ctx.fillStyle = '#000000';
+        ctx.fillText(ft.text, ox + ft.x + 1, oy + ft.y + 1);
+        ctx.fillStyle = ft.color;
+        ctx.fillText(ft.text, ox + ft.x, oy + ft.y);
+      }
+
+      // Boss 頂部血條
+      if (bossRef && bossRef.hp > 0) {
+        const bw = 240;
+        const bx = ox + (PLAY_W - bw) / 2;
+        const by = oy + 10;
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(bx - 4, by - 4, bw + 8, 22);
+        ctx.strokeStyle = bossRef.finalBoss ? '#a855f7' : '#ef4444';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(bx - 3, by - 3, bw + 6, 20);
+        const ratio = Math.max(0, bossRef.hp / bossRef.maxHp);
+        ctx.fillStyle = bossRef.finalBoss ? '#9333ea' : '#dc2626';
+        ctx.fillRect(bx, by, Math.floor(bw * ratio), 14);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        const bossTitle = bossRef.finalBoss ? '終極魔王・災滅' : '火焰魔龍';
+        ctx.fillText(`${bossTitle} ${bossRef.hp}/${bossRef.maxHp}`, ox + PLAY_W / 2, by + 11);
+      }
+    }
+
+    function drawPlayer(ox, oy) {
+      const p = game.player;
+      if (p.invuln > 0 && Math.floor(game.time * 18) % 2 === 0) return;
+
+      const px = ox + Math.floor(p.x) - 1;
+      const py = oy + Math.floor(p.y) - 1;
+      const isMoving = !!(keys['KeyW'] || keys['KeyS'] || keys['KeyA'] || keys['KeyD'] ||
+                          keys['ArrowUp'] || keys['ArrowDown'] || keys['ArrowLeft'] || keys['ArrowRight']);
+      const stepFrame = isMoving && (Math.floor(p.walkAnim) % 2 === 1);
+      const bob = stepFrame ? 1 : 0;
+
+      const sprMap = {
+        down: SPRITES.heroDown,
+        up: SPRITES.heroUp,
+        left: SPRITES.heroLeft,
+        right: SPRITES.heroRight
+      };
+      const sprMap2 = {
+        down: SPRITES.heroDown2,
+        up: SPRITES.heroUp2,
+        left: SPRITES.heroLeft2,
+        right: SPRITES.heroRight2
+      };
+      ctx.drawImage(stepFrame ? sprMap2[p.dir] : sprMap[p.dir], px, py - bob);
+
+      // 揮劍方塊劍刃特效
+      if (p.attackTimer > 0 && p.swordLevel > 0) {
+        const hb = getSwordHitbox();
+        const bladeColor = p.swordLevel >= 2 ? '#38bdf8' : '#e2e8f0';
+        const hiltColor = '#facc15';
+        ctx.fillStyle = bladeColor;
+        if (p.dir === 'up') {
+          ctx.fillRect(ox + p.x + 8, oy + hb.y + 4, 6, 22);
+          ctx.fillStyle = hiltColor;
+          ctx.fillRect(ox + p.x + 4, oy + p.y - 4, 14, 4);
+        } else if (p.dir === 'down') {
+          ctx.fillRect(ox + p.x + 8, oy + p.y + p.h + 2, 6, 22);
+          ctx.fillStyle = hiltColor;
+          ctx.fillRect(ox + p.x + 4, oy + p.y + p.h, 14, 4);
+        } else if (p.dir === 'left') {
+          ctx.fillRect(ox + hb.x + 4, oy + p.y + 8, 22, 6);
+          ctx.fillStyle = hiltColor;
+          ctx.fillRect(ox + p.x - 4, oy + p.y + 4, 4, 14);
+        } else {
+          ctx.fillRect(ox + p.x + p.w + 2, oy + p.y + 8, 22, 6);
+          ctx.fillStyle = hiltColor;
+          ctx.fillRect(ox + p.x + p.w, oy + p.y + 4, 4, 14);
+        }
+      }
+    }
+
+    // =========================================================================
+    // 12. 頂部 HUD、對話提示框、背包選單與標題/結算畫面
+    // =========================================================================
+    function drawHUD() {
+      const p = game.player;
+      const room = getCurrentRoom();
+
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, SCREEN_W, HUD_H);
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(0, HUD_H - 2, SCREEN_W, 2);
+
+      // 左側：4x4 迷你小地圖 + 地點名稱
+      const mmX = 12;
+      const mmY = 8;
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(mmX - 2, mmY - 2, 52, 36);
+      for (let ry = 0; ry < 4; ry++) {
+        for (let rx = 0; rx < 4; rx++) {
+          const visited = game.visited[`${rx},${ry}`];
+          ctx.fillStyle = visited ? '#475569' : '#0f172a';
+          ctx.fillRect(mmX + rx * 12, mmY + ry * 8, 10, 6);
+          if (!game.inSecretShop && game.rx === rx && game.ry === ry) {
+            ctx.fillStyle = Math.floor(game.time * 4) % 2 === 0 ? '#4ade80' : '#facc15';
+            ctx.fillRect(mmX + rx * 12 + 2, mmY + ry * 8 + 1, 6, 4);
+          }
+        }
+      }
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(room.name, 10, 56);
+
+      // 中央：E 鍵武器槽 & Q 鍵道具槽
+      const drawSlot = (sx, keyLabel, title) => {
+        ctx.strokeStyle = '#64748b';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sx, 12, 46, 40);
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(sx + 6, 5, 14, 12);
+        ctx.fillStyle = '#facc15';
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(keyLabel, sx + 13, 15);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '9px monospace';
+        ctx.fillText(title, sx + 23, 60);
+      };
+
+      // E 槽：劍
+      drawSlot(162, 'E', p.swordLevel === 0 ? '無武器' : p.swordLevel >= 2 ? '聖光劍' : '勇者劍');
+      if (p.swordLevel > 0) {
+        ctx.drawImage(p.swordLevel >= 2 ? SPRITES.sword2 : SPRITES.sword1, 177, 24);
+      } else {
+        ctx.fillStyle = '#64748b';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('無', 185, 37);
+      }
+
+      // Q 槽：當前道具
+      let qTitle = '';
+      let qSpr = null;
+      let qBadge = '';
+      if (p.equippedItem === 'bomb') {
+        qTitle = '1:炸彈'; qSpr = SPRITES.bomb; qBadge = `x${p.bombs}`;
+      } else if (p.equippedItem === 'potion') {
+        qTitle = '2:藥水'; qSpr = SPRITES.potion; qBadge = `x${p.potions}`;
+      } else if (p.equippedItem === 'boomerang') {
+        qTitle = '3:迴力鏢'; qSpr = SPRITES.boomerang;
+      } else if (p.equippedItem === 'flame') {
+        qTitle = '4:火焰'; qSpr = SPRITES.flameIcon;
+        qBadge = p.flameCooldown > 0 ? `${p.flameCooldown.toFixed(1)}s` : 'OK';
+      } else if (p.equippedItem === 'bow' && p.equippedBow) {
+        qTitle = `5:${BOWS[p.equippedBow].name}`;
+        qSpr = SPRITES[BOWS[p.equippedBow].sprite];
+        qBadge = p.equippedArrow === 'normal' ? '∞' : `x${p.arrows[p.equippedArrow]}`;
+      }
+      drawSlot(220, 'Q', qTitle);
+      if (qSpr) ctx.drawImage(qSpr, 235, 21);
+      if (qBadge) {
+        ctx.fillStyle = (p.equippedItem === 'flame' && p.flameCooldown > 0) ? '#ef4444' : '#f8fafc';
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(qBadge, 243, 49);
+      }
+
+      // 中右：盧比、鑰匙、靜音提示
+      ctx.drawImage(SPRITES.rupee, 278, 12);
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${p.rupees}`, 296, 25);
+
+      ctx.drawImage(SPRITES.key, 278, 34);
+      ctx.fillStyle = '#facc15';
+      ctx.fillText(`${p.keys}`, 296, 47);
+
+      // 右側：愛心生命條 (每顆心代表 2 HP)
+      ctx.fillStyle = '#f87171';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('- 連恩 LIFE -', 350, 16);
+
+      const maxHearts = Math.ceil(p.maxHp / 2);
+      for (let i = 0; i < maxHearts; i++) {
+        const hx = 348 + (i % 7) * 20;
+        const hy = 22 + Math.floor(i / 7) * 18;
+        const hpForHeart = p.hp - i * 2;
+        if (hpForHeart >= 2) {
+          ctx.drawImage(SPRITES.heartFull, hx, hy);
+        } else if (hpForHeart === 1) {
+          ctx.drawImage(SPRITES.heartEmpty, hx, hy);
+          ctx.drawImage(SPRITES.heartFull, 0, 0, 8, 16, hx, hy, 8, 16);
+        } else {
+          ctx.drawImage(SPRITES.heartEmpty, hx, hy);
+        }
+      }
+
+      // 打靶小遊戲即時分數條
+      if (game.minigame.active) {
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(156, PLAY_Y + 4, 200, 24);
+        ctx.strokeStyle = '#facc15';
+        ctx.strokeRect(156, PLAY_Y + 4, 200, 24);
+        ctx.fillStyle = '#facc15';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`打靶計時 ${game.minigame.timer.toFixed(1)}s ｜ 命中 ${game.minigame.score} 分`, 256, PLAY_Y + 20);
+      }
+    }
+
+    function drawToast() {
+      if (game.toast.timer <= 0 || !game.toast.text) return;
+      const text = game.toast.text;
+      // 簡易自動斷行 (每行約 26 個全形字)
+      const lines = [];
+      let cur = '';
+      for (const ch of text) {
+        cur += ch;
+        if (cur.length >= 26) {
+          lines.push(cur);
+          cur = '';
+        }
+      }
+      if (cur) lines.push(cur);
+
+      const boxH = 18 + lines.length * 18;
+      const boxY = SCREEN_H - boxH - 10;
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.92)';
+      ctx.fillRect(16, boxY, SCREEN_W - 32, boxH);
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(16, boxY, SCREEN_W - 32, boxH);
+
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = 'bold 13px monospace';
+      ctx.textAlign = 'center';
+      lines.forEach((ln, idx) => {
+        ctx.fillText(ln, SCREEN_W / 2, boxY + 20 + idx * 18);
+      });
+    }
+
+    const MENU_ITEM_RECTS = [
+      { slot: 1, key: 'bomb',      label: '1.炸彈',   x: 42,  y: 112, w: 80, h: 64 },
+      { slot: 2, key: 'potion',    label: '2.藥水',   x: 130, y: 112, w: 80, h: 64 },
+      { slot: 3, key: 'boomerang', label: '3.迴力鏢', x: 218, y: 112, w: 80, h: 64 },
+      { slot: 4, key: 'flame',     label: '4.火焰',   x: 306, y: 112, w: 80, h: 64 },
+      { slot: 5, key: 'bow',       label: '5.弓箭',   x: 394, y: 112, w: 80, h: 64 }
+    ];
+
+    function drawPauseMenu() {
+      const p = game.player;
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.92)';
+      ctx.fillRect(16, 40, SCREEN_W - 32, SCREEN_H - 64);
+      ctx.strokeStyle = '#facc15';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(16, 40, SCREEN_W - 32, SCREEN_H - 64);
+
+      ctx.fillStyle = '#facc15';
+      ctx.font = 'bold 20px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('連恩的背包與狀態 (按 R 關閉)', SCREEN_W / 2, 74);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px monospace';
+      ctx.fillText('點擊或按 1-5 切換裝備 ｜ Z 切弓 ｜ X 切箭 ｜ M 靜音', SCREEN_W / 2, 96);
+
+      // 繪製 5 個道具格
+      for (const r of MENU_ITEM_RECTS) {
+        const selected = p.equippedItem === r.key;
+        const unlocked =
+          r.key === 'bomb' || r.key === 'potion' ||
+          (r.key === 'boomerang' && p.hasBoomerang) ||
+          (r.key === 'flame' && p.hasFlame) ||
+          (r.key === 'bow' && p.ownedBows.length > 0);
+
+        ctx.fillStyle = selected ? '#1e3a8a' : '#0f172a';
+        ctx.fillRect(r.x, r.y, r.w, r.h);
+        ctx.strokeStyle = selected ? '#facc15' : '#475569';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+        ctx.fillStyle = unlocked ? '#f8fafc' : '#475569';
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(r.label, r.x + r.w / 2, r.y + 16);
+
+        if (unlocked) {
+          let spr = SPRITES.bomb;
+          let info = '';
+          if (r.key === 'bomb') { spr = SPRITES.bomb; info = `剩餘 ${p.bombs}`; }
+          else if (r.key === 'potion') { spr = SPRITES.potion; info = `剩餘 ${p.potions}`; }
+          else if (r.key === 'boomerang') { spr = SPRITES.boomerang; info = '已取得'; }
+          else if (r.key === 'flame') { spr = SPRITES.flameIcon; info = '冷卻3秒'; }
+          else if (r.key === 'bow') { spr = SPRITES[BOWS[p.equippedBow].sprite]; info = BOWS[p.equippedBow].name; }
+          ctx.drawImage(spr, r.x + r.w / 2 - 8, r.y + 22);
+          ctx.fillStyle = '#facc15';
+          ctx.font = '10px monospace';
+          ctx.fillText(info, r.x + r.w / 2, r.y + 56);
+        } else {
+          ctx.fillStyle = '#475569';
+          ctx.font = '11px monospace';
+          ctx.fillText('未獲得', r.x + r.w / 2, r.y + 42);
+        }
+      }
+
+      // 下半部左：角色與武器資訊
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('【裝備與進度】', 42, 206);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '12px monospace';
+      const swordName = p.swordLevel === 0 ? '無' : p.swordLevel >= 2 ? '聖光之劍 (攻3)' : '勇者之劍 (攻2)';
+      ctx.fillText(`主武器：${swordName}`, 42, 228);
+      ctx.fillText(`盧比：${p.rupees} ｜ 古代鑰匙：${p.keys}`, 42, 248);
+      ctx.fillText(`火焰魔龍：${game.bossDefeated ? '已討伐' : '未討伐'}`, 42, 268);
+      ctx.fillText(`終極災滅：${game.zaimieDefeated ? '已討伐' : '未討伐'}`, 42, 288);
+      ctx.fillText(`音效狀態：${sound.muted ? '已靜音 (M)' : '開啟 (M)'}`, 42, 308);
+
+      // 弓箭庫存 (僅在擁有弓或箭時顯示細節，零隱藏地點提示)
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 12px monospace';
+      const bowText = p.ownedBows.length > 0 ? p.ownedBows.map(id => BOWS[id].name).join('、') : '尚無';
+      ctx.fillText(`持有弓：${bowText}`, 42, 336);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '11px monospace';
+      ctx.fillText(
+        `箭矢：普∞ 火${p.arrows.fire} 毒${p.arrows.poison} 爆${p.arrows.explosive} 光${p.arrows.light}`,
+        42, 356
+      );
+
+      // 下半部右：4x4 探索大地圖
+      ctx.fillStyle = '#facc15';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('【4x4 世界地圖】', 310, 206);
+      const mapX = 310;
+      const mapY = 220;
+      for (let ry = 0; ry < 4; ry++) {
+        for (let rx = 0; rx < 4; rx++) {
+          const k = `${rx},${ry}`;
+          const vis = game.visited[k];
+          ctx.fillStyle = vis ? '#334155' : '#0f172a';
+          ctx.fillRect(mapX + rx * 40, mapY + ry * 32, 36, 28);
+          ctx.strokeStyle = (!game.inSecretShop && game.rx === rx && game.ry === ry) ? '#facc15' : '#475569';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(mapX + rx * 40, mapY + ry * 32, 36, 28);
+          if (vis) {
+            ctx.fillStyle = '#e2e8f0';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'center';
+            const shortName = game.rooms[k].name.slice(0, 2);
+            ctx.fillText(shortName, mapX + rx * 40 + 18, mapY + ry * 32 + 17);
+          }
+        }
+      }
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '11px monospace';
+      ctx.fillText(`目前位置：${getCurrentRoom().name}`, 388, 368);
+    }
+
+    function drawTitleScreen() {
+      ctx.fillStyle = '#020617';
+      ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+      // 閃爍方塊星空
+      for (let i = 0; i < 36; i++) {
+        const sx = (i * 73 + 19) % SCREEN_W;
+        const sy = (i * 47 + 29) % SCREEN_H;
+        const blink = Math.floor(game.time * 3 + i) % 3 === 0;
+        ctx.fillStyle = blink ? '#facc15' : '#334155';
+        ctx.fillRect(sx, sy, 4, 4);
+      }
+
+      // 標題像素外框
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(46, 54, SCREEN_W - 92, 116);
+      ctx.strokeStyle = '#facc15';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(46, 54, SCREEN_W - 92, 116);
+
+      ctx.fillStyle = '#facc15';
+      ctx.font = 'bold 38px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('像素勇者傳說', SCREEN_W / 2, 114);
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 16px monospace';
+      ctx.fillText('尋找聖物的冒險', SCREEN_W / 2, 148);
+
+      // 置中放大顯示連恩像素角色
+      ctx.drawImage(SPRITES.heroDown, 0, 0, 24, 24, SCREEN_W / 2 - 36, 198, 72, 72);
+
+      // 操作說明
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('WASD / 方向鍵：移動    E：攻擊 / 互動', SCREEN_W / 2, 314);
+      ctx.fillText('Q：使用道具    1-5：切換道具    Z/X：切弓與箭', SCREEN_W / 2, 340);
+      ctx.fillText('R：背包與地圖    M：靜音開關', SCREEN_W / 2, 366);
+
+      // 閃爍按 Enter 開始提示 (不含任何任務劇透文字)
+      if (Math.floor(game.time * 2.5) % 2 === 0) {
+        ctx.fillStyle = '#4ade80';
+        ctx.font = 'bold 20px monospace';
+        ctx.fillText('▶ 按 ENTER 開始冒險 ◀', SCREEN_W / 2, 424);
+      }
+    }
+
+    function drawGameOver() {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+      ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+      ctx.fillStyle = '#ef4444';
+      ctx.font = 'bold 36px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('連恩倒下了...', SCREEN_W / 2, 180);
+
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '15px monospace';
+      ctx.fillText(`探索區域：${Object.keys(game.visited).length} / 16`, SCREEN_W / 2, 235);
+      ctx.fillText(`持有盧比：${game.player.rupees}`, SCREEN_W / 2, 265);
+
+      if (Math.floor(game.time * 2.5) % 2 === 0) {
+        ctx.fillStyle = '#facc15';
+        ctx.font = 'bold 18px monospace';
+        ctx.fillText('按 ENTER 重新開始冒險', SCREEN_W / 2, 340);
+      }
+    }
+
+    function drawVictory() {
+      ctx.fillStyle = '#020617';
+      ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+      for (let i = 0; i < 40; i++) {
+        const sx = (i * 89 + Math.floor(game.time * 20)) % SCREEN_W;
+        const sy = (i * 53) % SCREEN_H;
+        ctx.fillStyle = i % 2 === 0 ? '#facc15' : '#38bdf8';
+        ctx.fillRect(sx, sy, 4, 4);
+      }
+
+      ctx.drawImage(SPRITES.relic, 0, 0, 24, 24, SCREEN_W / 2 - 36, 70, 72, 72);
+
+      ctx.fillStyle = '#facc15';
+      ctx.font = 'bold 32px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('恭喜通關！', SCREEN_W / 2, 190);
+
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText('勇者連恩擊敗了終極魔王【災滅】！', SCREEN_W / 2, 232);
+
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '14px monospace';
+      const mins = Math.floor(game.playTime / 60);
+      const secs = Math.floor(game.playTime % 60);
+      ctx.fillText(`通關時間：${mins} 分 ${secs} 秒`, SCREEN_W / 2, 282);
+      ctx.fillText(`探索地圖：${Object.keys(game.visited).length} / 16 區域`, SCREEN_W / 2, 310);
+      ctx.fillText(`剩餘盧比：${game.player.rupees} ｜ 聖物碎片：${game.player.relicShards}`, SCREEN_W / 2, 338);
+
+      if (Math.floor(game.time * 2.5) % 2 === 0) {
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = 'bold 18px monospace';
+        ctx.fillText('按 ENTER 再次遊玩', SCREEN_W / 2, 410);
+      }
+    }
+
+    function render() {
+      ctx.clearRect(0, 0, SCREEN_W, SCREEN_H);
+
+      if (game.state === 'TITLE') {
+        drawTitleScreen();
+        return;
+      }
+
+      if (game.state === 'VICTORY') {
+        drawVictory();
+        return;
+      }
+
+      if (game.state === 'TRANSITION' && game.transition) {
+        const tr = game.transition;
+        const oldRoom = game.rooms[`${game.rx},${game.ry}`];
+        const newRoom = game.rooms[`${tr.nextRx},${tr.nextRy}`];
+        const t = Math.min(1, tr.progress);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, PLAY_Y, PLAY_W, PLAY_H);
+        ctx.clip();
+
+        const oldOx = -tr.dx * PLAY_W * t;
+        const oldOy = PLAY_Y - tr.dy * PLAY_H * t;
+        const newOx = tr.dx * PLAY_W * (1 - t);
+        const newOy = PLAY_Y + tr.dy * PLAY_H * (1 - t);
+
+        drawRoom(oldRoom, oldOx, oldOy, false);
+        drawRoom(newRoom, newOx, newOy, false);
+        ctx.restore();
+
+        drawHUD();
+        return;
+      }
+
+      // 一般遊玩 / 暫停 / 結束底圖
+      drawRoom(getCurrentRoom(), 0, PLAY_Y, true);
+      drawHUD();
+      drawToast();
+
+      if (game.state === 'PAUSED') {
+        drawPauseMenu();
+      } else if (game.state === 'GAMEOVER') {
+        drawGameOver();
+      }
+    }
+
+    // =========================================================================
+    // 13. 輸入事件控制與主遊戲迴圈
+    // =========================================================================
+    function resetAndStartGame() {
+      sound.init();
+      game = createInitialGame();
+      enterRoom(1, 1, false);
+      game.state = 'PLAYING';
+      sound.sfxSecret();
+      showToast('連恩踏上了旅程！先向北方的神秘老人對話 (按 E) 吧。', 4.0);
+    }
+
+    function togglePauseMenu() {
+      if (game.state === 'PLAYING') {
+        game.state = 'PAUSED';
+        sound.sfxMenuSelect();
+      } else if (game.state === 'PAUSED') {
+        game.state = 'PLAYING';
+        sound.sfxMenuSelect();
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      const isEnter = e.code === 'Enter' || e.code === 'NumpadEnter' || e.key === 'Enter' || e.keyCode === 13;
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code) || isEnter) {
+        e.preventDefault();
+      }
+      keys[e.code] = true;
+
+      if (e.code === 'KeyM') {
+        sound.init();
+        sound.toggleMute();
+        showToast(sound.muted ? '已靜音' : '已開啟音效', 1.4);
+        return;
+      }
+
+      if (game.state === 'TITLE' || game.state === 'GAMEOVER' || game.state === 'VICTORY') {
+        if (isEnter) {
+          resetAndStartGame();
+        }
+        return;
+      }
+
+      if (e.code === 'KeyR') {
+        togglePauseMenu();
+        return;
+      }
+
+      if (game.state === 'PLAYING' || game.state === 'PAUSED') {
+        if (e.code === 'Digit1' || e.code === 'Numpad1') { switchItemSlot(1); return; }
+        if (e.code === 'Digit2' || e.code === 'Numpad2') { switchItemSlot(2); return; }
+        if (e.code === 'Digit3' || e.code === 'Numpad3') { switchItemSlot(3); return; }
+        if (e.code === 'Digit4' || e.code === 'Numpad4') { switchItemSlot(4); return; }
+        if (e.code === 'Digit5' || e.code === 'Numpad5') { switchItemSlot(5); return; }
+        if (e.code === 'KeyZ') { cycleBow(); return; }
+        if (e.code === 'KeyX') { cycleArrow(); return; }
+      }
+
+      if (game.state !== 'PLAYING') return;
+
+      sound.init();
+      if (e.code === 'KeyE') {
+        performAttackOrInteract();
+      } else if (e.code === 'KeyQ') {
+        useEquippedItem();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+
+    window.addEventListener('blur', () => {
+      for (const k in keys) keys[k] = false;
+    });
+
+    canvas.addEventListener('pointerdown', () => {
+      window.focus();
+      canvas.focus();
+    });
+
+    canvas.addEventListener('click', (e) => {
+      window.focus();
+      canvas.focus();
+      const rect = canvas.getBoundingClientRect();
+      const mx = ((e.clientX - rect.left) / rect.width) * SCREEN_W;
+      const my = ((e.clientY - rect.top) / rect.height) * SCREEN_H;
+
+      if (game.state === 'TITLE' || game.state === 'GAMEOVER' || game.state === 'VICTORY') {
+        resetAndStartGame();
+        return;
+      }
+
+      if (game.state === 'PAUSED') {
+        for (const r of MENU_ITEM_RECTS) {
+          if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+            switchItemSlot(r.slot);
+            return;
+          }
+        }
+      }
+    });
+
+    let lastTime = 0;
+    function gameLoop(ts) {
+      if (!lastTime) lastTime = ts;
+      const dt = Math.min(0.05, (ts - lastTime) / 1000);
+      lastTime = ts;
+      update(dt);
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    window.onload = function () {
+      window.focus();
+      canvas.focus();
+      requestAnimationFrame(gameLoop);
+    };
+  </script>
+</body>
+</html>
